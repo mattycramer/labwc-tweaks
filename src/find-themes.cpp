@@ -68,6 +68,12 @@ static bool hasOpenboxOrLabwcSubdir(QString path)
     return entries.contains("openbox-3") || entries.contains("labwc");
 }
 
+static bool hasGtkSubdir(QString path)
+{
+    QStringList entries = QDir(path).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    return entries.contains("gtk-3.0") || entries.contains("gtk-4.0");
+}
+
 QStringList findLabwcThemes(void)
 {
     QStringList paths;
@@ -90,6 +96,34 @@ QStringList findLabwcThemes(void)
             }
         }
     }
+    themes.removeDuplicates();
+    themes.sort(Qt::CaseInsensitive);
+    return themes;
+}
+
+QStringList findGtkThemes(void)
+{
+    QStringList paths;
+
+    paths.push_back(QString(qgetenv("HOME") + "/.themes"));
+    QStringList standardPaths =
+            QStandardPaths::standardLocations(QStandardPaths::GenericDataLocation);
+    for (const QString &path : std::as_const(standardPaths)) {
+        paths.push_back(QString(path + "/themes"));
+    }
+
+    QStringList themes;
+    themes.push_front("Adwaita");
+    for (const QString &path : std::as_const(paths)) {
+        QDir dir(path);
+        QStringList entries = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &entry : std::as_const(entries)) {
+            if (hasGtkSubdir(QString(path + "/" + entry))) {
+                themes.push_back(entry);
+            }
+        }
+    }
+
     themes.removeDuplicates();
     themes.sort(Qt::CaseInsensitive);
     return themes;

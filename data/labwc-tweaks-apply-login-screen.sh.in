@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+set -eEuo pipefail
+trap 'rc=$?; printf "labwc-tweaks login helper failed near line %d: %s\n" "${LINENO}" "${BASH_COMMAND}" >&2; exit "${rc}"' ERR
+IFS=$'\n\t'
+
+readonly REGREET_TOML="/etc/greetd/regreet.toml"
+readonly REGREET_CSS="/etc/greetd/regreet.css"
+readonly GREETER_AUTOSTART="/etc/labwc-greeter/autostart"
+readonly LOGIN_DATA_DIR="@CMAKE_INSTALL_FULL_DATADIR@/labwc-tweaks"
+readonly LOGIN_BACKGROUND_PREFIX="${LOGIN_DATA_DIR}/login-screen-background"
+readonly CSS_BEGIN="/* >>> labwc-tweaks regreet begin >>> */"
+readonly CSS_END="/* <<< labwc-tweaks regreet end <<< */"
+readonly AUTOSTART_BEGIN="# >>> labwc-tweaks regreet wallpaper begin >>>"
+readonly AUTOSTART_END="# <<< labwc-tweaks regreet wallpaper end <<<"
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_theme() {
+  local value="$1"
+  [[ "$value" =~ ^[[:alnum:]_.:+ -]+$ ]] || die "invalid GTK theme name: ${value}"
+}
+
+validate_color() {
+  local value="$1"
+  [[ "$value" =~ ^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$ ]] && return 0
+  [[ "$value" =~ ^rgba?\([0-9[:space:].,]+\)$ ]] && return 0
+  [[ "$value" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] && return 0
+  die "invalid CSS color: ${value}"
+}
+
+strip_managed_block() {
+  local file="$1"
+  local begin="$2"
+  local end="$3"
+  local output="$4"
+
+  if [[ ! -f "$file" ]]; then
+    : >"$output"
+    return 0
+  fi
+
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$file" >"$output"
+}
+
+set_toml_value() {
+  local file="$1"
+  local section="$2"
+  local key="$3"
+  local value="$4"
+  local tmp
+
+  tmp="$(mktemp)"
+  if [[ ! -f "$file" ]]; then
+    printf '[%s]\n%s = %s\n' "$section" "$key" "$value" >"$file"
+    return 0
+  fi
+
+  awk -v wanted_section="[$section]" -v wanted_key="$key" -v wanted_value="$value" '
+    BEGIN {
+      in_section = 0
+      section_seen = 0
+      key_written = 0
+    }
+    /^\[/ {
+      if (in_section && !key_written) {
+        print wanted_key " = " wanted_value
+        key_written = 1
+      }
+      if ($0 == wanted_section) {
+        in_section = 1
+        section_seen = 1
+      } else {
+        in_section = 0
+      }
+      print
+      next
+    }
+    {
+      if (in_section && $1 == wanted_key) {
+        if (!key_written) {
+          print wanted_key " = " wanted_value
+          key_written = 1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (!section_seen) {
+        if (NR > 0) {
+          print ""
+        }
+        print wanted_section
+        print wanted_key " = " wanted_value
+      } else if (in_section && !key_written) {
+        print wanted_key " = " wanted_value
+      }
+    }
+  ' "$file" >"$tmp"
+  install -D -m 0644 "$tmp" "$file"
+  rm -f -- "$tmp"
+}
+
+write_regreet_css() {
+  local panel_bg="$1"
+  local text_color="$2"
+  local accent_color="$3"
+  local field_bg="$4"
+  local tmp cleaned
+
+  cleaned="$(mktemp)"
+  tmp="$(mktemp)"
+  strip_managed_block "$REGREET_CSS" "$CSS_BEGIN" "$CSS_END" "$cleaned"
+  cat "$cleaned" >"$tmp"
+  cat >>"$tmp" <<EOF
+
+$CSS_BEGIN
+window,
+overlay,
+picture {
+  color: ${text_color};
+  background-color: transparent;
+}
+
+selection {
+  color: ${field_bg};
+  background-color: ${accent_color};
+}
+
+frame.background,
+frame.background > border {
+  background-color: ${panel_bg};
+  border: 1px solid ${accent_color};
+}
+
+frame.background > label,
+frame.background > grid,
+frame.background > grid > label,
+entry,
+passwordentry,
+combobox,
+button,
+togglebutton {
+  color: ${text_color};
+}
+
+entry,
+passwordentry,
+combobox,
+button,
+togglebutton {
+  background-color: ${field_bg};
+  border: 1px solid ${accent_color};
+}
+
+entry image,
+passwordentry image,
+togglebutton image,
+button image {
+  color: ${accent_color};
+}
+
+togglebutton:checked,
+button.suggested-action {
+  color: ${panel_bg};
+  background-color: ${accent_color};
+}
+$CSS_END
+EOF
+  install -D -m 0644 "$tmp" "$REGREET_CSS"
+  rm -f -- "$cleaned" "$tmp"
+}
+
+write_greeter_autostart() {
+  local background_target="$1"
+  local tmp cleaned
+  tmp="$(mktemp)"
+  cleaned="$(mktemp)"
+
+  strip_managed_block "$GREETER_AUTOSTART" "$AUTOSTART_BEGIN" "$AUTOSTART_END" "$cleaned"
+  if [[ ! -s "$cleaned" ]]; then
+    printf '#!/bin/sh\nset -eu\n' >"$cleaned"
+  fi
+
+  emit_block() {
+    printf '%s\n' "$AUTOSTART_BEGIN"
+    if [[ -n "$background_target" ]]; then
+      printf '%s\n' 'if command -v swaybg >/dev/null 2>&1; then'
+      printf '  /usr/bin/swaybg -i "%s" -m fill >/dev/null 2>&1 &\n' "$background_target"
+      printf '%s\n' 'fi'
+    else
+      printf '%s\n' '# regreet wallpaper disabled'
+    fi
+    printf '%s\n\n' "$AUTOSTART_END"
+  }
+
+  inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$inserted" -eq 0 && "$line" == exec\ * ]]; then
+      emit_block >>"$tmp"
+      inserted=1
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+  done <"$cleaned"
+  if [[ "$inserted" -eq 0 ]]; then
+    emit_block >>"$tmp"
+  fi
+
+  install -D -m 0755 "$tmp" "$GREETER_AUTOSTART"
+  rm -f -- "$cleaned" "$tmp"
+}
+
+background=""
+gtk_theme=""
+panel_bg=""
+text_color=""
+accent_color=""
+field_bg=""
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --background)
+      background="${2:-}"
+      shift 2
+      ;;
+    --gtk-theme)
+      gtk_theme="${2:-}"
+      shift 2
+      ;;
+    --panel-bg)
+      panel_bg="${2:-}"
+      shift 2
+      ;;
+    --text-color)
+      text_color="${2:-}"
+      shift 2
+      ;;
+    --accent-color)
+      accent_color="${2:-}"
+      shift 2
+      ;;
+    --field-bg)
+      field_bg="${2:-}"
+      shift 2
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$gtk_theme" ]] || die "--gtk-theme is required"
+[[ -n "$panel_bg" ]] || die "--panel-bg is required"
+[[ -n "$text_color" ]] || die "--text-color is required"
+[[ -n "$accent_color" ]] || die "--accent-color is required"
+[[ -n "$field_bg" ]] || die "--field-bg is required"
+
+validate_theme "$gtk_theme"
+validate_color "$panel_bg"
+validate_color "$text_color"
+validate_color "$accent_color"
+validate_color "$field_bg"
+
+background_target=""
+if [[ -n "$background" ]]; then
+  [[ -f "$background" ]] || die "background file not found: ${background}"
+  [[ ! -L "$background" ]] || die "background path must not be a symlink: ${background}"
+  install -d -m 0755 "$LOGIN_DATA_DIR"
+  extension="${background##*.}"
+  [[ "$extension" != "$background" ]] || extension="png"
+  background_target="${LOGIN_BACKGROUND_PREFIX}.${extension}"
+  install -D -m 0644 "$background" "$background_target"
+fi
+
+set_toml_value "$REGREET_TOML" "GTK" "theme_name" "\"${gtk_theme}\""
+write_regreet_css "$panel_bg" "$text_color" "$accent_color" "$field_bg"
+write_greeter_autostart "$background_target"

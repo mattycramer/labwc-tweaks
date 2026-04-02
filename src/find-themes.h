@@ -9,5 +9,6 @@ enum lab_icon_theme_type {
 
 QStringList findIconThemes(enum lab_icon_theme_type type);
 QStringList findLabwcThemes(void);
+QStringList findGtkThemes(void);
 
 #endif // FIND_THEMES_H

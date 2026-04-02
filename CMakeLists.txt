@@ -41,7 +41,10 @@ set(PROJECT_SOURCES
 
     src/layoutmodel.cpp src/layoutmodel.h
 
+    src/config-utils.cpp src/config-utils.h
+    src/desktop-entry.cpp src/desktop-entry.h
     src/environment.cpp src/environment.h
+    src/simple-ini.cpp src/simple-ini.h
     src/setting.cpp src/setting.h
     src/settings.cpp src/settings.h
     src/xml.cpp src/xml.h
@@ -52,10 +55,13 @@ set(PROJECT_SOURCES
     src/nodename.cpp src/nodename.h
 
     src/appearance.cpp src/appearance.h src/appearance.ui
+    src/defaultapps.cpp src/defaultapps.h src/defaultapps.ui
+    src/display.cpp src/display.h src/display.ui
     src/behaviour.cpp src/behaviour.h src/behaviour.ui
     src/mouse.cpp src/mouse.h src/mouse.ui
     src/keyboard.cpp src/keyboard.h src/keyboard.ui
     src/touchscreen.cpp src/touchscreen.h src/touchscreen.ui
+    src/loginscreen.cpp src/loginscreen.h src/loginscreen.ui
     src/about.cpp src/about.h src/about.ui
     src/template.cpp src/template.h src/template.ui
 )
@@ -123,6 +129,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     PROJECT_APPSTREAM_ID="${PROJECT_APPSTREAM_ID}"
     PROJECT_DATA_DIR="${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}"
     PROJECT_ICON_SYSTEM_PATH="${PROJECT_ICON_SYSTEM_PATH}"
+    PROJECT_LIBEXEC_DIR="${CMAKE_INSTALL_FULL_LIBEXECDIR}"
     PROJECT_TRANSLATION_TEST_ENABLED=${PROJECT_TRANSLATION_TEST_ENABLED}
     PROJECT_TRANSLATION_TEST_LANGUAGE="${PROJECT_TRANSLATION_TEST_LANGUAGE}"
 )
@@ -146,6 +153,12 @@ configure_file("${CMAKE_SOURCE_DIR}/data/${PROJECT_APPSTREAM_ID}.desktop.in"
 configure_file("${CMAKE_SOURCE_DIR}/data/${PROJECT_APPSTREAM_ID}.appdata.xml.in"
     "${CMAKE_BINARY_DIR}/${PROJECT_APPSTREAM_ID}.appdata.xml" @ONLY
 )
+configure_file("${CMAKE_SOURCE_DIR}/data/labwc-tweaks-apply-login-screen.sh.in"
+    "${CMAKE_BINARY_DIR}/labwc-tweaks-apply-login-screen" @ONLY
+)
+configure_file("${CMAKE_SOURCE_DIR}/data/org.labwc.labwc-tweaks.policy.in"
+    "${CMAKE_BINARY_DIR}/org.labwc.labwc-tweaks.policy" @ONLY
+)
 install(TARGETS ${PROJECT_NAME}
     BUNDLE DESTINATION .
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -160,6 +173,12 @@ install(FILES "${PROJECT_DESKTOP_FILES}"
 install(FILES "${CMAKE_BINARY_DIR}/${PROJECT_APPSTREAM_ID}.svg"
     # Don't use PROJECT_ICON_SYSTEM_PATH here which is absolute and doesn't take prefixes into account
     DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps"
+)
+install(PROGRAMS "${CMAKE_BINARY_DIR}/labwc-tweaks-apply-login-screen"
+    DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}"
+)
+install(FILES "${CMAKE_BINARY_DIR}/org.labwc.labwc-tweaks.policy"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/polkit-1/actions"
 )
 qt_finalize_executable(${PROJECT_NAME})
 #===================================================================================================

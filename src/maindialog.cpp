@@ -8,10 +8,13 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
 #include "appearance.h"
+#include "defaultapps.h"
+#include "display.h"
 #include "behaviour.h"
 #include "mouse.h"
 #include "keyboard.h"
 #include "touchscreen.h"
+#include "loginscreen.h"
 #include "about.h"
 #include "template.h"
 
@@ -47,24 +50,36 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
     item0->setText(tr("Appearance"));
 
     QListWidgetItem *item1 = new QListWidgetItem(list);
-    item1->setIcon(QIcon::fromTheme("preferences-desktop"));
-    item1->setText(tr("Behaviour"));
+    item1->setIcon(QIcon::fromTheme("preferences-desktop-default-applications"));
+    item1->setText(tr("Default Apps"));
 
     QListWidgetItem *item2 = new QListWidgetItem(list);
-    item2->setIcon(QIcon::fromTheme("input-mouse"));
-    item2->setText(tr("Mouse & Touchpad"));
+    item2->setIcon(QIcon::fromTheme("video-display"));
+    item2->setText(tr("Display"));
 
     QListWidgetItem *item3 = new QListWidgetItem(list);
-    item3->setIcon(QIcon::fromTheme("preferences-desktop-keyboard"));
-    item3->setText(tr("Keyboard"));
+    item3->setIcon(QIcon::fromTheme("preferences-desktop"));
+    item3->setText(tr("Behaviour"));
 
     QListWidgetItem *item4 = new QListWidgetItem(list);
-    item4->setIcon(QIcon::fromTheme("preferences-desktop-touchscreen"));
-    item4->setText(tr("Touchscreen"));
+    item4->setIcon(QIcon::fromTheme("input-mouse"));
+    item4->setText(tr("Mouse & Touchpad"));
 
     QListWidgetItem *item5 = new QListWidgetItem(list);
-    item5->setIcon(QIcon::fromTheme("help-about"));
-    item5->setText(tr("About"));
+    item5->setIcon(QIcon::fromTheme("preferences-desktop-keyboard"));
+    item5->setText(tr("Keyboard"));
+
+    QListWidgetItem *item6 = new QListWidgetItem(list);
+    item6->setIcon(QIcon::fromTheme("preferences-desktop-touchscreen"));
+    item6->setText(tr("Touchscreen"));
+
+    QListWidgetItem *item7 = new QListWidgetItem(list);
+    item7->setIcon(QIcon::fromTheme("system-switch-user"));
+    item7->setText(tr("Login Screen"));
+
+    QListWidgetItem *item8 = new QListWidgetItem(list);
+    item8->setIcon(QIcon::fromTheme("help-about"));
+    item8->setText(tr("About"));
 
     if (!qgetenv("LABWC_TWEAKS_SHOW_TEMPLATE").isEmpty()) {
         QListWidgetItem *item99 = new QListWidgetItem(list);
@@ -89,6 +104,12 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
     m_pageAppearance = new Appearance();
     stack->addWidget(m_pageAppearance);
 
+    m_pageDefaultApps = new DefaultApps();
+    stack->addWidget(m_pageDefaultApps);
+
+    m_pageDisplay = new DisplayPage();
+    stack->addWidget(m_pageDisplay);
+
     m_pageBehaviour = new Behaviour();
     stack->addWidget(m_pageBehaviour);
 
@@ -100,6 +121,9 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
 
     m_pageTouchscreen = new Touchscreen();
     stack->addWidget(m_pageTouchscreen);
+
+    m_pageLoginScreen = new LoginScreen();
+    stack->addWidget(m_pageLoginScreen);
 
     m_pageAbout = new About();
     stack->addWidget(m_pageAbout);
@@ -146,10 +170,13 @@ MainDialog::~MainDialog()
 void MainDialog::activate()
 {
     m_pageAppearance->activate();
+    m_pageDefaultApps->activate();
+    m_pageDisplay->activate();
     m_pageBehaviour->activate();
     m_pageMouse->activate();
     m_pageKeyboard->activate();
     m_pageTouchscreen->activate();
+    m_pageLoginScreen->activate();
     m_pageAbout->loadInfo();
     m_pageAbout->getEnv();
     if (!qgetenv("LABWC_TWEAKS_SHOW_TEMPLATE").isEmpty()) {
@@ -160,10 +187,13 @@ void MainDialog::activate()
 void MainDialog::onApply()
 {
     m_pageAppearance->onApply();
+    m_pageDefaultApps->onApply();
+    m_pageDisplay->onApply();
     m_pageBehaviour->onApply();
     m_pageMouse->onApply();
     m_pageKeyboard->onApply();
     m_pageTouchscreen->onApply();
+    m_pageLoginScreen->onApply();
 
     xml_save();
     environmentSave();

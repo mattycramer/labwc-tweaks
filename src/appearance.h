@@ -2,6 +2,8 @@
 #define APPEARANCE_H
 #include <QWidget>
 
+class QLabel;
+
 QT_BEGIN_NAMESPACE
 namespace Ui {
 class pageAppearance;
@@ -20,6 +22,12 @@ public:
     void onApply();
 
 private:
+    void updateThemercPath();
+    QString wallpaperBlock() const;
+    void writeGtkSettings() const;
+    void writeWallpaperConfig() const;
+    void writePanelStyle() const;
+
     Ui::pageAppearance *ui;
 };
 #endif // APPEARANCE_H

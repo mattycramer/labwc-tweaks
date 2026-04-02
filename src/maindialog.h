@@ -5,10 +5,13 @@
 #include "settings.h"
 
 class Appearance;
+class DefaultApps;
+class DisplayPage;
 class Behaviour;
 class Mouse;
 class Keyboard;
 class Touchscreen;
+class LoginScreen;
 class About;
 class Template;
 
@@ -26,10 +29,13 @@ private:
 
     QDialogButtonBox *m_buttonBox;
     Appearance *m_pageAppearance;
+    DefaultApps *m_pageDefaultApps;
+    DisplayPage *m_pageDisplay;
     Behaviour *m_pageBehaviour;
     Mouse *m_pageMouse;
     Keyboard *m_pageKeyboard;
     Touchscreen *m_pageTouchscreen;
+    LoginScreen *m_pageLoginScreen;
     About *m_pageAbout;
     Template *m_pageTemplate;
 };

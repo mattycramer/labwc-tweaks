@@ -17,11 +17,11 @@
         <number>9</number>
        </property>
        <item>
-        <widget class="QGroupBox" name="groupBox1">
+        <widget class="QGroupBox" name="groupTheme">
          <property name="title">
           <string>Theme</string>
          </property>
-         <layout class="QGridLayout" name="groupBox1_gridLayout" columnstretch="0,0,1">
+         <layout class="QGridLayout" name="gridLayoutTheme" columnstretch="0,0,1">
           <property name="horizontalSpacing">
            <number>16</number>
           </property>
@@ -38,22 +38,273 @@
           <item row="0" column="1">
            <widget class="QComboBox" name="openboxTheme"/>
           </item>
-          <item row="0" column="2">
-           <spacer name="horizontalSpacer_8">
-            <property name="orientation">
-             <enum>Qt::Orientation::Horizontal</enum>
-            </property>
-           </spacer>
-          </item>
           <item row="1" column="0">
            <widget class="QLabel" name="label_1">
+            <property name="text">
+             <string>GTK theme</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QComboBox" name="gtkTheme"/>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="label_2">
             <property name="text">
              <string>Icon theme</string>
             </property>
            </widget>
           </item>
-          <item row="1" column="1">
+          <item row="2" column="1">
            <widget class="QComboBox" name="iconTheme"/>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="label_3">
+            <property name="text">
+             <string>Active themerc</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QLineEdit" name="themercPath">
+            <property name="readOnly">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="2" rowspan="4">
+           <spacer name="horizontalSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupWallpaper">
+         <property name="title">
+          <string>Wallpaper</string>
+         </property>
+         <layout class="QGridLayout" name="gridLayoutWallpaper" columnstretch="0,0,0,1">
+          <property name="horizontalSpacing">
+           <number>16</number>
+          </property>
+          <property name="verticalSpacing">
+           <number>8</number>
+          </property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_4">
+            <property name="text">
+             <string>Engine</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="wallpaperEngine">
+            <item>
+             <property name="text">
+              <string>Disabled</string>
+             </property>
+             <property name="data">
+              <string>none</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>swaybg</string>
+             </property>
+             <property name="data">
+              <string>swaybg</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>swww</string>
+             </property>
+             <property name="data">
+              <string>swww</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>wpaperd</string>
+             </property>
+             <property name="data">
+              <string>wpaperd</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="label_5">
+            <property name="text">
+             <string>Image</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1" colspan="2">
+           <widget class="QLineEdit" name="wallpaperPath"/>
+          </item>
+          <item row="1" column="3">
+           <widget class="QPushButton" name="browseWallpaper">
+            <property name="text">
+             <string>Browse…</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="label_6">
+            <property name="text">
+             <string>Mode</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QComboBox" name="wallpaperMode">
+            <item>
+             <property name="text">
+              <string>Fill</string>
+             </property>
+             <property name="data">
+              <string>fill</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Fit</string>
+             </property>
+             <property name="data">
+              <string>fit</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Stretch</string>
+             </property>
+             <property name="data">
+              <string>stretch</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="2" column="2" colspan="2">
+           <widget class="QLabel" name="label_7">
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+            <property name="text">
+             <string>swww uses the closest resize mode available for the selected wallpaper style.</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupPanel">
+         <property name="title">
+          <string>Panel Colors</string>
+         </property>
+         <layout class="QGridLayout" name="gridLayoutPanel" columnstretch="0,0,1">
+          <property name="horizontalSpacing">
+           <number>16</number>
+          </property>
+          <property name="verticalSpacing">
+           <number>8</number>
+          </property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_8">
+            <property name="text">
+             <string>Target</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="panelTarget">
+            <item>
+             <property name="text">
+              <string>Disabled</string>
+             </property>
+             <property name="data">
+              <string>none</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Waybar</string>
+             </property>
+             <property name="data">
+              <string>waybar</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>SFWBar</string>
+             </property>
+             <property name="data">
+              <string>sfwbar</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="label_9">
+            <property name="text">
+             <string>Panel background</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QLineEdit" name="panelBackground"/>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="label_10">
+            <property name="text">
+             <string>Surface color</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QLineEdit" name="panelSurface"/>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="label_11">
+            <property name="text">
+             <string>Text color</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QLineEdit" name="panelText"/>
+          </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="label_12">
+            <property name="text">
+             <string>Accent color</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QLineEdit" name="panelAccent"/>
+          </item>
+          <item row="5" column="0" colspan="2">
+           <widget class="QLabel" name="label_13">
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+            <property name="text">
+             <string>These colors are written as a managed override block into the detected panel config.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="2" rowspan="6">
+           <spacer name="horizontalSpacer_2">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+           </spacer>
           </item>
          </layout>
         </widget>
@@ -84,7 +335,7 @@
             </property>
            </widget>
           </item>
-          <item row="0" column="5">
+          <item row="0" column="2">
            <spacer name="horizontalSpacer_11">
             <property name="orientation">
              <enum>Qt::Orientation::Horizontal</enum>
@@ -107,7 +358,7 @@
            <number>8</number>
           </property>
           <item row="0" column="0">
-           <widget class="QLabel" name="label_2">
+           <widget class="QLabel" name="label_14">
             <property name="text">
              <string>Corner radius</string>
             </property>
@@ -120,15 +371,8 @@
             </property>
            </widget>
           </item>
-          <item row="0" column="2">
-           <spacer name="horizontalSpacer_6">
-            <property name="orientation">
-             <enum>Qt::Orientation::Horizontal</enum>
-            </property>
-           </spacer>
-          </item>
           <item row="1" column="0">
-           <widget class="QLabel" name="label_3">
+           <widget class="QLabel" name="label_15">
             <property name="text">
              <string>Maximized decoration</string>
             </property>
@@ -136,6 +380,13 @@
           </item>
           <item row="1" column="1">
            <widget class="QComboBox" name="maximizedDecoration"/>
+          </item>
+          <item row="0" column="2" rowspan="2">
+           <spacer name="horizontalSpacer_3">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+           </spacer>
           </item>
          </layout>
         </widget>
@@ -153,7 +404,7 @@
            <number>8</number>
           </property>
           <item row="0" column="0">
-           <widget class="QLabel" name="label_5">
+           <widget class="QLabel" name="label_16">
             <property name="text">
              <string>Decoration mode</string>
             </property>
@@ -163,7 +414,7 @@
            <widget class="QComboBox" name="decoration"/>
           </item>
           <item row="0" column="2">
-           <spacer name="horizontalSpacer">
+           <spacer name="horizontalSpacer_4">
             <property name="orientation">
              <enum>Qt::Orientation::Horizontal</enum>
             </property>
