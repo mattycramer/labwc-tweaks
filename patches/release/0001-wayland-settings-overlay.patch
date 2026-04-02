@@ -1,0 +1,3309 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 81ca14fb058f60877515ca2b18bbc6637ff25b53..85059e46342578b12813d82f04ba7c24ca086210 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -41,7 +41,10 @@ set(PROJECT_SOURCES
+ 
+     src/layoutmodel.cpp src/layoutmodel.h
+ 
++    src/config-utils.cpp src/config-utils.h
++    src/desktop-entry.cpp src/desktop-entry.h
+     src/environment.cpp src/environment.h
++    src/simple-ini.cpp src/simple-ini.h
+     src/setting.cpp src/setting.h
+     src/settings.cpp src/settings.h
+     src/xml.cpp src/xml.h
+@@ -52,10 +55,13 @@ set(PROJECT_SOURCES
+     src/nodename.cpp src/nodename.h
+ 
+     src/appearance.cpp src/appearance.h src/appearance.ui
++    src/defaultapps.cpp src/defaultapps.h src/defaultapps.ui
++    src/display.cpp src/display.h src/display.ui
+     src/behaviour.cpp src/behaviour.h src/behaviour.ui
+     src/mouse.cpp src/mouse.h src/mouse.ui
+     src/keyboard.cpp src/keyboard.h src/keyboard.ui
+     src/touchscreen.cpp src/touchscreen.h src/touchscreen.ui
++    src/loginscreen.cpp src/loginscreen.h src/loginscreen.ui
+     src/about.cpp src/about.h src/about.ui
+     src/template.cpp src/template.h src/template.ui
+ )
+@@ -123,6 +129,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
+     PROJECT_APPSTREAM_ID="${PROJECT_APPSTREAM_ID}"
+     PROJECT_DATA_DIR="${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}"
+     PROJECT_ICON_SYSTEM_PATH="${PROJECT_ICON_SYSTEM_PATH}"
++    PROJECT_LIBEXEC_DIR="${CMAKE_INSTALL_FULL_LIBEXECDIR}"
+     PROJECT_TRANSLATION_TEST_ENABLED=${PROJECT_TRANSLATION_TEST_ENABLED}
+     PROJECT_TRANSLATION_TEST_LANGUAGE="${PROJECT_TRANSLATION_TEST_LANGUAGE}"
+ )
+@@ -146,6 +153,12 @@ configure_file("${CMAKE_SOURCE_DIR}/data/${PROJECT_APPSTREAM_ID}.desktop.in"
+ configure_file("${CMAKE_SOURCE_DIR}/data/${PROJECT_APPSTREAM_ID}.appdata.xml.in"
+     "${CMAKE_BINARY_DIR}/${PROJECT_APPSTREAM_ID}.appdata.xml" @ONLY
+ )
++configure_file("${CMAKE_SOURCE_DIR}/data/labwc-tweaks-apply-login-screen.sh.in"
++    "${CMAKE_BINARY_DIR}/labwc-tweaks-apply-login-screen" @ONLY
++)
++configure_file("${CMAKE_SOURCE_DIR}/data/org.labwc.labwc-tweaks.policy.in"
++    "${CMAKE_BINARY_DIR}/org.labwc.labwc-tweaks.policy" @ONLY
++)
+ install(TARGETS ${PROJECT_NAME}
+     BUNDLE DESTINATION .
+     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+@@ -161,6 +174,12 @@ install(FILES "${CMAKE_BINARY_DIR}/${PROJECT_APPSTREAM_ID}.svg"
+     # Don't use PROJECT_ICON_SYSTEM_PATH here which is absolute and doesn't take prefixes into account
+     DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps"
+ )
++install(PROGRAMS "${CMAKE_BINARY_DIR}/labwc-tweaks-apply-login-screen"
++    DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}"
++)
++install(FILES "${CMAKE_BINARY_DIR}/org.labwc.labwc-tweaks.policy"
++    DESTINATION "${CMAKE_INSTALL_DATADIR}/polkit-1/actions"
++)
+ qt_finalize_executable(${PROJECT_NAME})
+ #===================================================================================================
+ # Configuration report
+diff --git a/data/labwc-tweaks-apply-login-screen.sh.in b/data/labwc-tweaks-apply-login-screen.sh.in
+new file mode 100644
+index 0000000000000000000000000000000000000000..22b6df77e1bd50c2fd0409f185229ed3b7d3d04c
+--- /dev/null
++++ b/data/labwc-tweaks-apply-login-screen.sh.in
+@@ -0,0 +1,284 @@
++#!/usr/bin/env bash
++set -eEuo pipefail
++trap 'rc=$?; printf "labwc-tweaks login helper failed near line %d: %s\n" "${LINENO}" "${BASH_COMMAND}" >&2; exit "${rc}"' ERR
++IFS=$'\n\t'
++
++readonly REGREET_TOML="/etc/greetd/regreet.toml"
++readonly REGREET_CSS="/etc/greetd/regreet.css"
++readonly GREETER_AUTOSTART="/etc/labwc-greeter/autostart"
++readonly LOGIN_DATA_DIR="@CMAKE_INSTALL_FULL_DATADIR@/labwc-tweaks"
++readonly LOGIN_BACKGROUND_PREFIX="${LOGIN_DATA_DIR}/login-screen-background"
++readonly CSS_BEGIN="/* >>> labwc-tweaks regreet begin >>> */"
++readonly CSS_END="/* <<< labwc-tweaks regreet end <<< */"
++readonly AUTOSTART_BEGIN="# >>> labwc-tweaks regreet wallpaper begin >>>"
++readonly AUTOSTART_END="# <<< labwc-tweaks regreet wallpaper end <<<"
++
++die() {
++  printf 'ERROR: %s\n' "$*" >&2
++  exit 1
++}
++
++validate_theme() {
++  local value="$1"
++  [[ "$value" =~ ^[[:alnum:]_.:+ -]+$ ]] || die "invalid GTK theme name: ${value}"
++}
++
++validate_color() {
++  local value="$1"
++  [[ "$value" =~ ^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$ ]] && return 0
++  [[ "$value" =~ ^rgba?\([0-9[:space:].,]+\)$ ]] && return 0
++  [[ "$value" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] && return 0
++  die "invalid CSS color: ${value}"
++}
++
++strip_managed_block() {
++  local file="$1"
++  local begin="$2"
++  local end="$3"
++  local output="$4"
++
++  if [[ ! -f "$file" ]]; then
++    : >"$output"
++    return 0
++  fi
++
++  awk -v begin="$begin" -v end="$end" '
++    $0 == begin { skip = 1; next }
++    $0 == end { skip = 0; next }
++    !skip { print }
++  ' "$file" >"$output"
++}
++
++set_toml_value() {
++  local file="$1"
++  local section="$2"
++  local key="$3"
++  local value="$4"
++  local tmp
++
++  tmp="$(mktemp)"
++  if [[ ! -f "$file" ]]; then
++    printf '[%s]\n%s = %s\n' "$section" "$key" "$value" >"$file"
++    return 0
++  fi
++
++  awk -v wanted_section="[$section]" -v wanted_key="$key" -v wanted_value="$value" '
++    BEGIN {
++      in_section = 0
++      section_seen = 0
++      key_written = 0
++    }
++    /^\[/ {
++      if (in_section && !key_written) {
++        print wanted_key " = " wanted_value
++        key_written = 1
++      }
++      if ($0 == wanted_section) {
++        in_section = 1
++        section_seen = 1
++      } else {
++        in_section = 0
++      }
++      print
++      next
++    }
++    {
++      if (in_section && $1 == wanted_key) {
++        if (!key_written) {
++          print wanted_key " = " wanted_value
++          key_written = 1
++        }
++        next
++      }
++      print
++    }
++    END {
++      if (!section_seen) {
++        if (NR > 0) {
++          print ""
++        }
++        print wanted_section
++        print wanted_key " = " wanted_value
++      } else if (in_section && !key_written) {
++        print wanted_key " = " wanted_value
++      }
++    }
++  ' "$file" >"$tmp"
++  install -D -m 0644 "$tmp" "$file"
++  rm -f -- "$tmp"
++}
++
++write_regreet_css() {
++  local panel_bg="$1"
++  local text_color="$2"
++  local accent_color="$3"
++  local field_bg="$4"
++  local tmp cleaned
++
++  cleaned="$(mktemp)"
++  tmp="$(mktemp)"
++  strip_managed_block "$REGREET_CSS" "$CSS_BEGIN" "$CSS_END" "$cleaned"
++  cat "$cleaned" >"$tmp"
++  cat >>"$tmp" <<EOF
++
++$CSS_BEGIN
++window,
++overlay,
++picture {
++  color: ${text_color};
++  background-color: transparent;
++}
++
++selection {
++  color: ${field_bg};
++  background-color: ${accent_color};
++}
++
++frame.background,
++frame.background > border {
++  background-color: ${panel_bg};
++  border: 1px solid ${accent_color};
++}
++
++frame.background > label,
++frame.background > grid,
++frame.background > grid > label,
++entry,
++passwordentry,
++combobox,
++button,
++togglebutton {
++  color: ${text_color};
++}
++
++entry,
++passwordentry,
++combobox,
++button,
++togglebutton {
++  background-color: ${field_bg};
++  border: 1px solid ${accent_color};
++}
++
++entry image,
++passwordentry image,
++togglebutton image,
++button image {
++  color: ${accent_color};
++}
++
++togglebutton:checked,
++button.suggested-action {
++  color: ${panel_bg};
++  background-color: ${accent_color};
++}
++$CSS_END
++EOF
++  install -D -m 0644 "$tmp" "$REGREET_CSS"
++  rm -f -- "$cleaned" "$tmp"
++}
++
++write_greeter_autostart() {
++  local background_target="$1"
++  local tmp cleaned
++  tmp="$(mktemp)"
++  cleaned="$(mktemp)"
++
++  strip_managed_block "$GREETER_AUTOSTART" "$AUTOSTART_BEGIN" "$AUTOSTART_END" "$cleaned"
++  if [[ ! -s "$cleaned" ]]; then
++    printf '#!/bin/sh\nset -eu\n' >"$cleaned"
++  fi
++
++  emit_block() {
++    printf '%s\n' "$AUTOSTART_BEGIN"
++    if [[ -n "$background_target" ]]; then
++      printf '%s\n' 'if command -v swaybg >/dev/null 2>&1; then'
++      printf '  /usr/bin/swaybg -i "%s" -m fill >/dev/null 2>&1 &\n' "$background_target"
++      printf '%s\n' 'fi'
++    else
++      printf '%s\n' '# regreet wallpaper disabled'
++    fi
++    printf '%s\n\n' "$AUTOSTART_END"
++  }
++
++  inserted=0
++  while IFS= read -r line || [[ -n "$line" ]]; do
++    if [[ "$inserted" -eq 0 && "$line" == exec\ * ]]; then
++      emit_block >>"$tmp"
++      inserted=1
++    fi
++    printf '%s\n' "$line" >>"$tmp"
++  done <"$cleaned"
++  if [[ "$inserted" -eq 0 ]]; then
++    emit_block >>"$tmp"
++  fi
++
++  install -D -m 0755 "$tmp" "$GREETER_AUTOSTART"
++  rm -f -- "$cleaned" "$tmp"
++}
++
++background=""
++gtk_theme=""
++panel_bg=""
++text_color=""
++accent_color=""
++field_bg=""
++
++while [[ "$#" -gt 0 ]]; do
++  case "$1" in
++    --background)
++      background="${2:-}"
++      shift 2
++      ;;
++    --gtk-theme)
++      gtk_theme="${2:-}"
++      shift 2
++      ;;
++    --panel-bg)
++      panel_bg="${2:-}"
++      shift 2
++      ;;
++    --text-color)
++      text_color="${2:-}"
++      shift 2
++      ;;
++    --accent-color)
++      accent_color="${2:-}"
++      shift 2
++      ;;
++    --field-bg)
++      field_bg="${2:-}"
++      shift 2
++      ;;
++    *)
++      die "unknown argument: $1"
++      ;;
++  esac
++done
++
++[[ -n "$gtk_theme" ]] || die "--gtk-theme is required"
++[[ -n "$panel_bg" ]] || die "--panel-bg is required"
++[[ -n "$text_color" ]] || die "--text-color is required"
++[[ -n "$accent_color" ]] || die "--accent-color is required"
++[[ -n "$field_bg" ]] || die "--field-bg is required"
++
++validate_theme "$gtk_theme"
++validate_color "$panel_bg"
++validate_color "$text_color"
++validate_color "$accent_color"
++validate_color "$field_bg"
++
++background_target=""
++if [[ -n "$background" ]]; then
++  [[ -f "$background" ]] || die "background file not found: ${background}"
++  [[ ! -L "$background" ]] || die "background path must not be a symlink: ${background}"
++  install -d -m 0755 "$LOGIN_DATA_DIR"
++  extension="${background##*.}"
++  [[ "$extension" != "$background" ]] || extension="png"
++  background_target="${LOGIN_BACKGROUND_PREFIX}.${extension}"
++  install -D -m 0644 "$background" "$background_target"
++fi
++
++set_toml_value "$REGREET_TOML" "GTK" "theme_name" "\"${gtk_theme}\""
++write_regreet_css "$panel_bg" "$text_color" "$accent_color" "$field_bg"
++write_greeter_autostart "$background_target"
+diff --git a/data/org.labwc.labwc-tweaks.policy.in b/data/org.labwc.labwc-tweaks.policy.in
+new file mode 100644
+index 0000000000000000000000000000000000000000..582eb0397841cfe715949b97994c4b5660e0239f
+--- /dev/null
++++ b/data/org.labwc.labwc-tweaks.policy.in
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE policyconfig PUBLIC
++ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
++ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
++<policyconfig>
++  <vendor>labwc-tweaks</vendor>
++  <action id="org.labwc.labwc-tweaks.login-screen">
++    <description>Apply login screen settings for greetd/regreet</description>
++    <message>Authentication is required to change greetd/regreet settings.</message>
++    <defaults>
++      <allow_any>auth_admin</allow_any>
++      <allow_inactive>auth_admin</allow_inactive>
++      <allow_active>auth_admin_keep</allow_active>
++    </defaults>
++    <annotate key="org.freedesktop.policykit.exec.path">@CMAKE_INSTALL_FULL_LIBEXECDIR@/labwc-tweaks-apply-login-screen</annotate>
++    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
++  </action>
++</policyconfig>
+diff --git a/src/appearance.cpp b/src/appearance.cpp
+index 819ad7beb3bc028c4ddf5ed5ff4afb8e64541db7..933409c8cdddf79e3cc7ae5b5bcbc227e13fa242 100644
+--- a/src/appearance.cpp
++++ b/src/appearance.cpp
+@@ -1,13 +1,56 @@
+ #include "appearance.h"
++
++#include <QDir>
++#include <QFileDialog>
++#include <QFileInfo>
++#include <QProcess>
++#include <QStringList>
++
++#include "config-utils.h"
+ #include "find-themes.h"
+ #include "macros.h"
++#include "simple-ini.h"
+ #include "settings.h"
+ #include "pair.h"
+ #include "./ui_appearance.h"
+ 
++namespace {
++QString tomlQuoted(const QString &value)
++{
++    QString escaped = value;
++    escaped.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
++    escaped.replace(QLatin1Char('"'), QStringLiteral("\\\""));
++    return QStringLiteral("\"%1\"").arg(escaped);
++}
++}
++
+ Appearance::Appearance(QWidget *parent) : QWidget(parent), ui(new Ui::pageAppearance)
+ {
+     ui->setupUi(this);
++
++    ui->wallpaperEngine->clear();
++    ui->wallpaperEngine->addItem(tr("Disabled"), QStringLiteral("none"));
++    ui->wallpaperEngine->addItem(QStringLiteral("swaybg"), QStringLiteral("swaybg"));
++    ui->wallpaperEngine->addItem(QStringLiteral("swww"), QStringLiteral("swww"));
++    ui->wallpaperEngine->addItem(QStringLiteral("wpaperd"), QStringLiteral("wpaperd"));
++
++    ui->wallpaperMode->clear();
++    ui->wallpaperMode->addItem(tr("Fill"), QStringLiteral("fill"));
++    ui->wallpaperMode->addItem(tr("Fit"), QStringLiteral("fit"));
++    ui->wallpaperMode->addItem(tr("Stretch"), QStringLiteral("stretch"));
++
++    ui->panelTarget->clear();
++    ui->panelTarget->addItem(tr("Disabled"), QStringLiteral("none"));
++    ui->panelTarget->addItem(QStringLiteral("Waybar"), QStringLiteral("waybar"));
++    ui->panelTarget->addItem(QStringLiteral("SFWBar"), QStringLiteral("sfwbar"));
++
++    connect(ui->openboxTheme, &QComboBox::currentTextChanged, this, [&]() { updateThemercPath(); });
++    connect(ui->browseWallpaper, &QPushButton::clicked, this, [&]() {
++        QString selected = QFileDialog::getOpenFileName(this, tr("Select wallpaper"), QDir::homePath());
++        if (!selected.isEmpty()) {
++            ui->wallpaperPath->setText(selected);
++        }
++    });
+ }
+ 
+ Appearance::~Appearance()
+@@ -17,11 +60,24 @@ Appearance::~Appearance()
+ 
+ void Appearance::activate()
+ {
++    SimpleIniFile appearanceState;
++    appearanceState.load(appConfigPath(QStringLiteral("appearance.ini")));
++
+     /* Labwc Theme */
+     settingsAddXmlStr("/labwc_config/theme/name", "");
+     QStringList labwcThemes = findLabwcThemes();
++    ui->openboxTheme->clear();
+     ui->openboxTheme->addItems(labwcThemes);
+     ui->openboxTheme->setCurrentIndex(labwcThemes.indexOf(getStr("/labwc_config/theme/name")));
++    updateThemercPath();
++
++    ui->gtkTheme->clear();
++    ui->gtkTheme->addItems(findGtkThemes());
++    const QString gtkTheme =
++            appearanceState.value(QStringLiteral("theme"), QStringLiteral("gtk_theme"),
++                                  QStringLiteral("Adwaita"));
++    int gtkIndex = ui->gtkTheme->findText(gtkTheme);
++    ui->gtkTheme->setCurrentIndex(gtkIndex >= 0 ? gtkIndex : 0);
+ 
+     /* Corner Radius */
+     settingsAddXmlInt("/labwc_config/theme/cornerRadius", 8);
+@@ -40,19 +96,62 @@ void Appearance::activate()
+ 
+     // Disable it when Drop Shadows is unchecked
+     ui->dropShadowsOnTiled->setEnabled(ui->dropShadows->isChecked());
+-    connect(ui->dropShadows, &QCheckBox::toggled, ui->dropShadowsOnTiled, &QWidget::setEnabled);
++    connect(ui->dropShadows, &QCheckBox::toggled, ui->dropShadowsOnTiled, &QWidget::setEnabled,
++            Qt::UniqueConnection);
+ 
+     /* Icon Theme */
+     settingsAddXmlStr("/labwc_config/theme/icon", "");
+     QStringList themes = findIconThemes(LAB_ICON_THEME_TYPE_ICON);
++    ui->iconTheme->clear();
+     ui->iconTheme->addItems(themes);
+     ui->iconTheme->setCurrentIndex(themes.indexOf(getStr("/labwc_config/theme/icon")));
+ 
++    const QString wallpaperEngine =
++            appearanceState.value(QStringLiteral("wallpaper"), QStringLiteral("engine"),
++                                  commandExists(QStringLiteral("swaybg")) ? QStringLiteral("swaybg")
++                                                                          : QStringLiteral("none"));
++    const int engineIndex = ui->wallpaperEngine->findData(wallpaperEngine);
++    ui->wallpaperEngine->setCurrentIndex(engineIndex >= 0 ? engineIndex : 0);
++    ui->wallpaperPath->setText(
++            appearanceState.value(QStringLiteral("wallpaper"), QStringLiteral("path")));
++    const QString wallpaperMode =
++            appearanceState.value(QStringLiteral("wallpaper"), QStringLiteral("mode"),
++                                  QStringLiteral("fill"));
++    const int wallpaperModeIndex = ui->wallpaperMode->findData(wallpaperMode);
++    ui->wallpaperMode->setCurrentIndex(wallpaperModeIndex >= 0 ? wallpaperModeIndex : 0);
++
++    QString panelStyle =
++            appearanceState.value(QStringLiteral("panel"), QStringLiteral("style_target"));
++    if (panelStyle.isEmpty()) {
++        if (QFileInfo::exists(userConfigPath(QStringLiteral("waybar/style.css")))) {
++            panelStyle = QStringLiteral("waybar");
++        } else if (QFileInfo::exists(userConfigPath(QStringLiteral("sfwbar/sfwbar.config")))) {
++            panelStyle = QStringLiteral("sfwbar");
++        } else {
++            panelStyle = QStringLiteral("none");
++        }
++    }
++    const int panelIndex = ui->panelTarget->findData(panelStyle);
++    ui->panelTarget->setCurrentIndex(panelIndex >= 0 ? panelIndex : 0);
++    ui->panelBackground->setText(
++            appearanceState.value(QStringLiteral("panel"), QStringLiteral("background"),
++                                  QStringLiteral("rgba(18, 24, 32, 0.92)")));
++    ui->panelSurface->setText(
++            appearanceState.value(QStringLiteral("panel"), QStringLiteral("surface"),
++                                  QStringLiteral("rgba(33, 46, 64, 0.84)")));
++    ui->panelText->setText(
++            appearanceState.value(QStringLiteral("panel"), QStringLiteral("text"),
++                                  QStringLiteral("#e5edf5")));
++    ui->panelAccent->setText(
++            appearanceState.value(QStringLiteral("panel"), QStringLiteral("accent"),
++                                  QStringLiteral("#7dd3fc")));
++
+     /* Decoration */
+     settingsAddXmlStr("/labwc_config/core/decoration", "server");
+     ui->decoration->setToolTip(tr("Specify decorations for xdg-shell windows"));
+ 
+     QVector<QSharedPointer<Pair>> decorations;
++    ui->decoration->clear();
+     decorations.append(
+             QSharedPointer<Pair>(new Pair("server", tr("Server Side Decoration (SSD)"))));
+     decorations.append(
+@@ -74,6 +173,7 @@ void Appearance::activate()
+     ui->maximizedDecoration->setToolTip(tr("Show server side decorations on maximized windows"));
+ 
+     QVector<QSharedPointer<Pair>> maximized_decorations;
++    ui->maximizedDecoration->clear();
+     maximized_decorations.append(QSharedPointer<Pair>(new Pair("titlebar", tr("Titlebar"))));
+     maximized_decorations.append(QSharedPointer<Pair>(new Pair("none", tr("None"))));
+ 
+@@ -98,4 +198,177 @@ void Appearance::onApply()
+     setStr("/labwc_config/theme/icon", TEXT(ui->iconTheme));
+     setStr("/labwc_config/core/decoration", DATA(ui->decoration));
+     setStr("/labwc_config/theme/maximizedDecoration", DATA(ui->maximizedDecoration));
++
++    SimpleIniFile appearanceState;
++    appearanceState.setValue(QStringLiteral("theme"), QStringLiteral("gtk_theme"),
++                             TEXT(ui->gtkTheme));
++    appearanceState.setValue(QStringLiteral("wallpaper"), QStringLiteral("engine"),
++                             ui->wallpaperEngine->currentData().toString());
++    appearanceState.setValue(QStringLiteral("wallpaper"), QStringLiteral("path"),
++                             ui->wallpaperPath->text().trimmed());
++    appearanceState.setValue(QStringLiteral("wallpaper"), QStringLiteral("mode"),
++                             ui->wallpaperMode->currentData().toString());
++    appearanceState.setValue(QStringLiteral("panel"), QStringLiteral("style_target"),
++                             ui->panelTarget->currentData().toString());
++    appearanceState.setValue(QStringLiteral("panel"), QStringLiteral("background"),
++                             ui->panelBackground->text().trimmed());
++    appearanceState.setValue(QStringLiteral("panel"), QStringLiteral("surface"),
++                             ui->panelSurface->text().trimmed());
++    appearanceState.setValue(QStringLiteral("panel"), QStringLiteral("text"),
++                             ui->panelText->text().trimmed());
++    appearanceState.setValue(QStringLiteral("panel"), QStringLiteral("accent"),
++                             ui->panelAccent->text().trimmed());
++    appearanceState.save(appConfigPath(QStringLiteral("appearance.ini")));
++
++    writeGtkSettings();
++    writeWallpaperConfig();
++    writePanelStyle();
++}
++
++void Appearance::updateThemercPath()
++{
++    ui->themercPath->setText(activeLabwcThemePath(ui->openboxTheme->currentText()));
++}
++
++QString Appearance::wallpaperBlock() const
++{
++    const QString engine = ui->wallpaperEngine->currentData().toString();
++    const QString path = ui->wallpaperPath->text().trimmed();
++    const QString mode = ui->wallpaperMode->currentData().toString();
++
++    if (engine == QStringLiteral("none") || path.isEmpty()) {
++        return QStringLiteral("# wallpaper disabled");
++    }
++
++    if (engine == QStringLiteral("swaybg")) {
++        return QStringLiteral("if command -v swaybg >/dev/null 2>&1; then\n"
++                              "  pkill -x swaybg >/dev/null 2>&1 || true\n"
++                              "  swaybg -i %1 -m %2 >/dev/null 2>&1 &\n"
++                              "fi")
++                .arg(shellSingleQuote(path), shellSingleQuote(mode));
++    }
++
++    if (engine == QStringLiteral("swww")) {
++        QString resizeMode = QStringLiteral("crop");
++        if (mode == QStringLiteral("fit")) {
++            resizeMode = QStringLiteral("fit");
++        } else if (mode == QStringLiteral("stretch")) {
++            resizeMode = QStringLiteral("stretch");
++        }
++        return QStringLiteral("if command -v swww >/dev/null 2>&1 && command -v swww-daemon >/dev/null 2>&1; then\n"
++                              "  pgrep -x swww-daemon >/dev/null 2>&1 || swww-daemon >/dev/null 2>&1 &\n"
++                              "  sleep 1\n"
++                              "  swww img %1 --transition-type none --resize %2 >/dev/null 2>&1 || true\n"
++                              "fi")
++                .arg(shellSingleQuote(path), shellSingleQuote(resizeMode));
++    }
++
++    if (engine == QStringLiteral("wpaperd")) {
++        return QStringLiteral("if command -v wpaperd >/dev/null 2>&1; then\n"
++                              "  pkill -x wpaperd >/dev/null 2>&1 || true\n"
++                              "  wpaperd >/dev/null 2>&1 &\n"
++                              "fi");
++    }
++
++    return QStringLiteral("# wallpaper disabled");
++}
++
++void Appearance::writeGtkSettings() const
++{
++    const QString gtkTheme = TEXT(ui->gtkTheme);
++    const QString iconTheme = TEXT(ui->iconTheme);
++
++    for (const QString &path :
++         { userConfigPath(QStringLiteral("gtk-3.0/settings.ini")),
++           userConfigPath(QStringLiteral("gtk-4.0/settings.ini")) }) {
++        SimpleIniFile settings;
++        settings.load(path);
++        settings.setValue(QStringLiteral("Settings"), QStringLiteral("gtk-theme-name"), gtkTheme);
++        settings.setValue(QStringLiteral("Settings"), QStringLiteral("gtk-icon-theme-name"),
++                          iconTheme);
++        settings.save(path);
++    }
++}
++
++void Appearance::writeWallpaperConfig() const
++{
++    const QString engine = ui->wallpaperEngine->currentData().toString();
++    if (engine == QStringLiteral("wpaperd") && !ui->wallpaperPath->text().trimmed().isEmpty()) {
++        const QString contents = QStringLiteral("[default]\npath = %1\nmode = %2\n")
++                                         .arg(tomlQuoted(ui->wallpaperPath->text().trimmed()),
++                                              tomlQuoted(
++                                                      ui->wallpaperMode->currentData().toString()));
++        writeTextFile(userConfigPath(QStringLiteral("wpaperd/config.toml")), contents);
++    }
++
++    replaceManagedBlock(userConfigPath(QStringLiteral("labwc/autostart")),
++                        QStringLiteral("# >>> labwc-tweaks wallpaper begin >>>"),
++                        QStringLiteral("# <<< labwc-tweaks wallpaper end <<<"), wallpaperBlock(),
++                        shellScriptHeader());
++}
++
++void Appearance::writePanelStyle() const
++{
++    const QString target = ui->panelTarget->currentData().toString();
++    const QString background = ui->panelBackground->text().trimmed();
++    const QString surface = ui->panelSurface->text().trimmed();
++    const QString text = ui->panelText->text().trimmed();
++    const QString accent = ui->panelAccent->text().trimmed();
++    const QString disabled = QStringLiteral("/* panel overrides disabled */");
++
++    if (target == QStringLiteral("waybar")) {
++        const QString block = QStringLiteral("@define-color panel %1;\n"
++                                             "@define-color panel_alt %2;\n"
++                                             "@define-color panel_hover %2;\n"
++                                             "@define-color border %4;\n"
++                                             "@define-color border_strong %4;\n"
++                                             "@define-color text %3;\n"
++                                             "@define-color muted %3;\n"
++                                             "@define-color amber %4;\n"
++                                             "@define-color sky %4;\n"
++                                             "@define-color cyan %4;\n"
++                                             "@define-color mint %4;\n"
++                                             "@define-color rose %4;\n"
++                                             "@define-color red %4;\n"
++                                             "@define-color mauve %4;")
++                                      .arg(background, surface, text, accent);
++        replaceManagedBlock(userConfigPath(QStringLiteral("waybar/style.css")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), block);
++        replaceManagedBlock(userConfigPath(QStringLiteral("sfwbar/sfwbar.config")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), disabled);
++    } else if (target == QStringLiteral("sfwbar")) {
++        const QString block = QStringLiteral("window#sfwbar {\n"
++                                             "  background-color: %1;\n"
++                                             "  color: %3;\n"
++                                             "  border-color: %4;\n"
++                                             "}\n"
++                                             "window#sfwbar button,\n"
++                                             "window#sfwbar label,\n"
++                                             "window#sfwbar image {\n"
++                                             "  background-color: %2;\n"
++                                             "  color: %3;\n"
++                                             "}\n"
++                                             "window#sfwbar button:hover,\n"
++                                             "window#sfwbar button:checked,\n"
++                                             "window#sfwbar button.active {\n"
++                                             "  background-color: %4;\n"
++                                             "  color: %1;\n"
++                                             "}")
++                                      .arg(background, surface, text, accent);
++        replaceManagedBlock(userConfigPath(QStringLiteral("sfwbar/sfwbar.config")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), block);
++        replaceManagedBlock(userConfigPath(QStringLiteral("waybar/style.css")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), disabled);
++    } else {
++        replaceManagedBlock(userConfigPath(QStringLiteral("waybar/style.css")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), disabled);
++        replaceManagedBlock(userConfigPath(QStringLiteral("sfwbar/sfwbar.config")),
++                            QStringLiteral("/* >>> labwc-tweaks panel begin >>> */"),
++                            QStringLiteral("/* <<< labwc-tweaks panel end <<< */"), disabled);
++    }
+ }
+diff --git a/src/appearance.h b/src/appearance.h
+index 083cf4f9711d235a44ca94d3a2b8e6d8233330bd..cb98a529b4064e4d4ae335bb19db3d692b82eeec 100644
+--- a/src/appearance.h
++++ b/src/appearance.h
+@@ -2,6 +2,8 @@
+ #define APPEARANCE_H
+ #include <QWidget>
+ 
++class QLabel;
++
+ QT_BEGIN_NAMESPACE
+ namespace Ui {
+ class pageAppearance;
+@@ -20,6 +22,12 @@ public:
+     void onApply();
+ 
+ private:
++    void updateThemercPath();
++    QString wallpaperBlock() const;
++    void writeGtkSettings() const;
++    void writeWallpaperConfig() const;
++    void writePanelStyle() const;
++
+     Ui::pageAppearance *ui;
+ };
+ #endif // APPEARANCE_H
+diff --git a/src/appearance.ui b/src/appearance.ui
+index bb76529d0e1710106ee7950428e4732fb530bf1a..00b9b82efdbf3b59ab87880843236c244da975ac 100644
+--- a/src/appearance.ui
++++ b/src/appearance.ui
+@@ -17,11 +17,11 @@
+         <number>9</number>
+        </property>
+        <item>
+-        <widget class="QGroupBox" name="groupBox1">
++        <widget class="QGroupBox" name="groupTheme">
+          <property name="title">
+           <string>Theme</string>
+          </property>
+-         <layout class="QGridLayout" name="groupBox1_gridLayout" columnstretch="0,0,1">
++         <layout class="QGridLayout" name="gridLayoutTheme" columnstretch="0,0,1">
+           <property name="horizontalSpacing">
+            <number>16</number>
+           </property>
+@@ -38,22 +38,273 @@
+           <item row="0" column="1">
+            <widget class="QComboBox" name="openboxTheme"/>
+           </item>
+-          <item row="0" column="2">
+-           <spacer name="horizontalSpacer_8">
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_1">
++            <property name="text">
++             <string>GTK theme</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1">
++           <widget class="QComboBox" name="gtkTheme"/>
++          </item>
++          <item row="2" column="0">
++           <widget class="QLabel" name="label_2">
++            <property name="text">
++             <string>Icon theme</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="1">
++           <widget class="QComboBox" name="iconTheme"/>
++          </item>
++          <item row="3" column="0">
++           <widget class="QLabel" name="label_3">
++            <property name="text">
++             <string>Active themerc</string>
++            </property>
++           </widget>
++          </item>
++          <item row="3" column="1">
++           <widget class="QLineEdit" name="themercPath">
++            <property name="readOnly">
++             <bool>true</bool>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="2" rowspan="4">
++           <spacer name="horizontalSpacer">
+             <property name="orientation">
+              <enum>Qt::Orientation::Horizontal</enum>
+             </property>
+            </spacer>
+           </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <widget class="QGroupBox" name="groupWallpaper">
++         <property name="title">
++          <string>Wallpaper</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayoutWallpaper" columnstretch="0,0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label_4">
++            <property name="text">
++             <string>Engine</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="wallpaperEngine">
++            <item>
++             <property name="text">
++              <string>Disabled</string>
++             </property>
++             <property name="data">
++              <string>none</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>swaybg</string>
++             </property>
++             <property name="data">
++              <string>swaybg</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>swww</string>
++             </property>
++             <property name="data">
++              <string>swww</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>wpaperd</string>
++             </property>
++             <property name="data">
++              <string>wpaperd</string>
++             </property>
++            </item>
++           </widget>
++          </item>
+           <item row="1" column="0">
+-           <widget class="QLabel" name="label_1">
++           <widget class="QLabel" name="label_5">
+             <property name="text">
+-             <string>Icon theme</string>
++             <string>Image</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1" colspan="2">
++           <widget class="QLineEdit" name="wallpaperPath"/>
++          </item>
++          <item row="1" column="3">
++           <widget class="QPushButton" name="browseWallpaper">
++            <property name="text">
++             <string>Browse…</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="0">
++           <widget class="QLabel" name="label_6">
++            <property name="text">
++             <string>Mode</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="1">
++           <widget class="QComboBox" name="wallpaperMode">
++            <item>
++             <property name="text">
++              <string>Fill</string>
++             </property>
++             <property name="data">
++              <string>fill</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>Fit</string>
++             </property>
++             <property name="data">
++              <string>fit</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>Stretch</string>
++             </property>
++             <property name="data">
++              <string>stretch</string>
++             </property>
++            </item>
++           </widget>
++          </item>
++          <item row="2" column="2" colspan="2">
++           <widget class="QLabel" name="label_7">
++            <property name="wordWrap">
++             <bool>true</bool>
++            </property>
++            <property name="text">
++             <string>swww uses the closest resize mode available for the selected wallpaper style.</string>
++            </property>
++           </widget>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <widget class="QGroupBox" name="groupPanel">
++         <property name="title">
++          <string>Panel Colors</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayoutPanel" columnstretch="0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label_8">
++            <property name="text">
++             <string>Target</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="panelTarget">
++            <item>
++             <property name="text">
++              <string>Disabled</string>
++             </property>
++             <property name="data">
++              <string>none</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>Waybar</string>
++             </property>
++             <property name="data">
++              <string>waybar</string>
++             </property>
++            </item>
++            <item>
++             <property name="text">
++              <string>SFWBar</string>
++             </property>
++             <property name="data">
++              <string>sfwbar</string>
++             </property>
++            </item>
++           </widget>
++          </item>
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_9">
++            <property name="text">
++             <string>Panel background</string>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="1">
+-           <widget class="QComboBox" name="iconTheme"/>
++           <widget class="QLineEdit" name="panelBackground"/>
++          </item>
++          <item row="2" column="0">
++           <widget class="QLabel" name="label_10">
++            <property name="text">
++             <string>Surface color</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="1">
++           <widget class="QLineEdit" name="panelSurface"/>
++          </item>
++          <item row="3" column="0">
++           <widget class="QLabel" name="label_11">
++            <property name="text">
++             <string>Text color</string>
++            </property>
++           </widget>
++          </item>
++          <item row="3" column="1">
++           <widget class="QLineEdit" name="panelText"/>
++          </item>
++          <item row="4" column="0">
++           <widget class="QLabel" name="label_12">
++            <property name="text">
++             <string>Accent color</string>
++            </property>
++           </widget>
++          </item>
++          <item row="4" column="1">
++           <widget class="QLineEdit" name="panelAccent"/>
++          </item>
++          <item row="5" column="0" colspan="2">
++           <widget class="QLabel" name="label_13">
++            <property name="wordWrap">
++             <bool>true</bool>
++            </property>
++            <property name="text">
++             <string>These colors are written as a managed override block into the detected panel config.</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="2" rowspan="6">
++           <spacer name="horizontalSpacer_2">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
+           </item>
+          </layout>
+         </widget>
+@@ -84,7 +335,7 @@
+             </property>
+            </widget>
+           </item>
+-          <item row="0" column="5">
++          <item row="0" column="2">
+            <spacer name="horizontalSpacer_11">
+             <property name="orientation">
+              <enum>Qt::Orientation::Horizontal</enum>
+@@ -107,7 +358,7 @@
+            <number>8</number>
+           </property>
+           <item row="0" column="0">
+-           <widget class="QLabel" name="label_2">
++           <widget class="QLabel" name="label_14">
+             <property name="text">
+              <string>Corner radius</string>
+             </property>
+@@ -120,15 +371,8 @@
+             </property>
+            </widget>
+           </item>
+-          <item row="0" column="2">
+-           <spacer name="horizontalSpacer_6">
+-            <property name="orientation">
+-             <enum>Qt::Orientation::Horizontal</enum>
+-            </property>
+-           </spacer>
+-          </item>
+           <item row="1" column="0">
+-           <widget class="QLabel" name="label_3">
++           <widget class="QLabel" name="label_15">
+             <property name="text">
+              <string>Maximized decoration</string>
+             </property>
+@@ -137,6 +381,13 @@
+           <item row="1" column="1">
+            <widget class="QComboBox" name="maximizedDecoration"/>
+           </item>
++          <item row="0" column="2" rowspan="2">
++           <spacer name="horizontalSpacer_3">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
++          </item>
+          </layout>
+         </widget>
+        </item>
+@@ -153,7 +404,7 @@
+            <number>8</number>
+           </property>
+           <item row="0" column="0">
+-           <widget class="QLabel" name="label_5">
++           <widget class="QLabel" name="label_16">
+             <property name="text">
+              <string>Decoration mode</string>
+             </property>
+@@ -163,7 +414,7 @@
+            <widget class="QComboBox" name="decoration"/>
+           </item>
+           <item row="0" column="2">
+-           <spacer name="horizontalSpacer">
++           <spacer name="horizontalSpacer_4">
+             <property name="orientation">
+              <enum>Qt::Orientation::Horizontal</enum>
+             </property>
+diff --git a/src/config-utils.cpp b/src/config-utils.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7f7655bc42b2ed16b9f6fb25515cbfa1f651cc9
+--- /dev/null
++++ b/src/config-utils.cpp
+@@ -0,0 +1,149 @@
++#include "config-utils.h"
++
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QSaveFile>
++#include <QStandardPaths>
++#include <QStringList>
++
++QString userConfigPath(const QString &relativePath)
++{
++    return QDir::homePath() + QStringLiteral("/.config/") + relativePath;
++}
++
++QString userDataPath(const QString &relativePath)
++{
++    return QDir::homePath() + QStringLiteral("/.local/share/") + relativePath;
++}
++
++QString userLocalBinPath(const QString &fileName)
++{
++    return QDir::homePath() + QStringLiteral("/.local/bin/") + fileName;
++}
++
++QString appConfigPath(const QString &fileName)
++{
++    return userConfigPath(QStringLiteral("labwc-tweaks/") + fileName);
++}
++
++QString activeLabwcThemePath(const QString &themeName)
++{
++    QStringList roots;
++    roots.push_back(QDir::homePath() + QStringLiteral("/.themes"));
++    const QStringList dataRoots =
++            QStandardPaths::standardLocations(QStandardPaths::GenericDataLocation);
++    for (const QString &root : dataRoots) {
++        roots.push_back(root + QStringLiteral("/themes"));
++    }
++
++    for (const QString &root : roots) {
++        const QStringList candidates = {
++            QStringLiteral("%1/%2/labwc/themerc").arg(root, themeName),
++            QStringLiteral("%1/%2/openbox-3/themerc").arg(root, themeName),
++        };
++        for (const QString &candidate : candidates) {
++            if (QFileInfo::exists(candidate)) {
++                return candidate;
++            }
++        }
++    }
++
++    return QString();
++}
++
++bool commandExists(const QString &program)
++{
++    return !QStandardPaths::findExecutable(program).isEmpty();
++}
++
++bool ensureDirectoryForFile(const QString &path)
++{
++    const QFileInfo info(path);
++    QDir dir = info.dir();
++    if (dir.exists()) {
++        return true;
++    }
++    return dir.mkpath(QStringLiteral("."));
++}
++
++bool writeTextFile(const QString &path, const QString &contents, QFileDevice::Permissions permissions)
++{
++    if (!ensureDirectoryForFile(path)) {
++        return false;
++    }
++
++    QSaveFile file(path);
++    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
++        return false;
++    }
++
++    QByteArray data = contents.toUtf8();
++    if (!data.endsWith('\n')) {
++        data.push_back('\n');
++    }
++
++    if (file.write(data) != data.length()) {
++        return false;
++    }
++    if (!file.commit()) {
++        return false;
++    }
++
++    QFile target(path);
++    target.setPermissions(permissions);
++    return true;
++}
++
++QString readTextFile(const QString &path)
++{
++    QFile file(path);
++    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        return QString();
++    }
++    return QString::fromUtf8(file.readAll());
++}
++
++bool replaceManagedBlock(const QString &path, const QString &beginMarker, const QString &endMarker,
++                         const QString &block, const QString &header)
++{
++    QString contents = readTextFile(path);
++    if (contents.isEmpty() && !QFileInfo::exists(path)) {
++        contents = header;
++    }
++    if (!contents.isEmpty() && !contents.endsWith('\n')) {
++        contents.push_back('\n');
++    }
++
++    QString managedBlock = beginMarker + QLatin1Char('\n') + block.trimmed() + QLatin1Char('\n')
++            + endMarker + QLatin1Char('\n');
++
++    int start = contents.indexOf(beginMarker);
++    int finish = contents.indexOf(endMarker);
++    if (start >= 0 && finish >= start) {
++        finish += endMarker.size();
++        if (finish < contents.size() && contents.at(finish) == QLatin1Char('\n')) {
++            ++finish;
++        }
++        contents.replace(start, finish - start, managedBlock);
++    } else {
++        if (!contents.isEmpty() && !contents.endsWith("\n\n")) {
++            contents.push_back('\n');
++        }
++        contents += managedBlock;
++    }
++
++    return writeTextFile(path, contents);
++}
++
++QString shellSingleQuote(const QString &value)
++{
++    QString escaped = value;
++    escaped.replace(QStringLiteral("'"), QStringLiteral("'\"'\"'"));
++    return QStringLiteral("'") + escaped + QStringLiteral("'");
++}
++
++QString shellScriptHeader(void)
++{
++    return QStringLiteral("#!/bin/sh\nset -eu\n");
++}
+diff --git a/src/config-utils.h b/src/config-utils.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b350e2cc01f64ff38cdd5770394fc4905b1c17b8
+--- /dev/null
++++ b/src/config-utils.h
+@@ -0,0 +1,26 @@
++#ifndef CONFIG_UTILS_H
++#define CONFIG_UTILS_H
++
++#include <QFileDevice>
++#include <QString>
++
++QString userConfigPath(const QString &relativePath);
++QString userDataPath(const QString &relativePath);
++QString userLocalBinPath(const QString &fileName);
++QString appConfigPath(const QString &fileName);
++QString activeLabwcThemePath(const QString &themeName);
++
++bool commandExists(const QString &program);
++bool ensureDirectoryForFile(const QString &path);
++bool writeTextFile(const QString &path, const QString &contents,
++                   QFileDevice::Permissions permissions = QFileDevice::ReadOwner
++                           | QFileDevice::WriteOwner | QFileDevice::ReadGroup
++                           | QFileDevice::ReadOther);
++QString readTextFile(const QString &path);
++bool replaceManagedBlock(const QString &path, const QString &beginMarker,
++                         const QString &endMarker, const QString &block,
++                         const QString &header = QString());
++QString shellSingleQuote(const QString &value);
++QString shellScriptHeader(void);
++
++#endif // CONFIG_UTILS_H
+diff --git a/src/defaultapps.cpp b/src/defaultapps.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..eec5e99ec31bc7e477e269b3c591b199d558e2e1
+--- /dev/null
++++ b/src/defaultapps.cpp
+@@ -0,0 +1,336 @@
++#include "defaultapps.h"
++
++#include <QComboBox>
++#include <QFile>
++#include <QFileInfo>
++#include <QProcess>
++#include <QStringList>
++
++#include "./ui_defaultapps.h"
++#include "config-utils.h"
++#include "simple-ini.h"
++
++namespace {
++constexpr auto kMimeSection = "Default Applications";
++constexpr auto kManagedNotificationBegin = "# >>> labwc-tweaks notifications begin >>>";
++constexpr auto kManagedNotificationEnd = "# <<< labwc-tweaks notifications end <<<";
++
++QString sectionName(const char *name)
++{
++    return QString::fromLatin1(name);
++}
++}
++
++DefaultApps::DefaultApps(QWidget *parent)
++    : QWidget(parent), ui(new Ui::pageDefaultApps)
++{
++    ui->setupUi(this);
++}
++
++DefaultApps::~DefaultApps()
++{
++    delete ui;
++}
++
++QList<DefaultApps::Category> DefaultApps::categories() const
++{
++    return {
++        { QStringLiteral("browser"), QStringLiteral("labwc-default-web-browser"), QString(),
++          { QStringLiteral("x-scheme-handler/http"), QStringLiteral("x-scheme-handler/https"),
++            QStringLiteral("text/html") },
++          ui->webBrowser },
++        { QStringLiteral("image"), QStringLiteral("labwc-default-image-viewer"), QString(),
++          { QStringLiteral("image/jpeg"), QStringLiteral("image/png"),
++            QStringLiteral("image/webp"), QStringLiteral("image/gif"),
++            QStringLiteral("image/svg+xml") },
++          ui->imageViewer },
++        { QStringLiteral("filemanager"), QStringLiteral("labwc-default-file-manager"),
++          QStringLiteral("FileManager"),
++          { QStringLiteral("inode/directory"), QStringLiteral("x-scheme-handler/file"),
++            QStringLiteral("x-scheme-handler/trash") },
++          ui->fileManager },
++        { QStringLiteral("terminal"), QStringLiteral("labwc-default-terminal"),
++          QStringLiteral("TerminalEmulator"),
++          { QStringLiteral("x-scheme-handler/terminal"),
++            QStringLiteral("application/x-terminal-emulator") },
++          ui->terminal },
++        { QStringLiteral("video"), QStringLiteral("labwc-default-video-player"), QString(),
++          { QStringLiteral("video/mp4"), QStringLiteral("video/x-matroska"),
++            QStringLiteral("video/webm"), QStringLiteral("video/x-msvideo"),
++            QStringLiteral("video/quicktime") },
++          ui->videoPlayer },
++        { QStringLiteral("music"), QStringLiteral("labwc-default-music-player"), QString(),
++          { QStringLiteral("audio/mpeg"), QStringLiteral("audio/flac"),
++            QStringLiteral("audio/ogg"), QStringLiteral("audio/x-wav"),
++            QStringLiteral("audio/mp4") },
++          ui->musicPlayer },
++        { QStringLiteral("archive"), QStringLiteral("labwc-default-archive-manager"), QString(),
++          { QStringLiteral("application/zip"), QStringLiteral("application/x-tar"),
++            QStringLiteral("application/x-7z-compressed"),
++            QStringLiteral("application/x-rar-compressed"),
++            QStringLiteral("application/x-xz-compressed-tar") },
++          ui->archiveManager },
++        { QStringLiteral("email"), QStringLiteral("labwc-default-email-client"), QString(),
++          { QStringLiteral("x-scheme-handler/mailto"), QStringLiteral("message/rfc822") },
++          ui->emailClient },
++        { QStringLiteral("calendar"), QStringLiteral("labwc-default-calendar"), QString(),
++          { QStringLiteral("text/calendar"), QStringLiteral("x-scheme-handler/webcal"),
++            QStringLiteral("x-scheme-handler/webcals") },
++          ui->calendar },
++        { QStringLiteral("pdf"), QStringLiteral("labwc-default-pdf-viewer"), QString(),
++          { QStringLiteral("application/pdf") },
++          ui->pdfViewer },
++        { QStringLiteral("editor"), QStringLiteral("labwc-default-text-editor"), QString(),
++          { QStringLiteral("text/plain"), QStringLiteral("text/markdown"),
++            QStringLiteral("application/json"), QStringLiteral("application/xml"),
++            QStringLiteral("text/x-log") },
++          ui->textEditor },
++    };
++}
++
++void DefaultApps::populateDesktopCombo(QComboBox *combo, const QString &currentId)
++{
++    combo->clear();
++    combo->addItem(tr("System default"), QString());
++    for (const DesktopEntry &entry : m_entries) {
++        combo->addItem(entry.name, entry.id);
++    }
++    ensureCurrentIdPresent(combo, currentId);
++
++    int index = combo->findData(currentId);
++    if (index < 0) {
++        index = 0;
++    }
++    combo->setCurrentIndex(index);
++}
++
++QString DefaultApps::desktopIdForProgram(const QString &program) const
++{
++    const QString simplified = program.trimmed();
++    if (simplified.isEmpty()) {
++        return QString();
++    }
++
++    const QString basename = QFileInfo(simplified).fileName();
++    for (const DesktopEntry &entry : m_entries) {
++        if (desktopExecProgram(entry.execLine) == basename || entry.id.startsWith(basename)) {
++            return entry.id;
++        }
++    }
++    return QString();
++}
++
++DesktopEntry DefaultApps::entryForId(const QString &id) const
++{
++    return m_entriesById.value(id);
++}
++
++void DefaultApps::ensureCurrentIdPresent(QComboBox *combo, const QString &desktopId)
++{
++    if (desktopId.isEmpty() || combo->findData(desktopId) >= 0) {
++        return;
++    }
++    combo->addItem(desktopId + tr(" (not installed)"), desktopId);
++}
++
++QString DefaultApps::currentMimeDefault(const SimpleIniFile &mimeApps,
++                                        const QStringList &mimeTypes) const
++{
++    for (const QString &mimeType : mimeTypes) {
++        QString value = mimeApps.value(sectionName(kMimeSection), mimeType);
++        if (value.isEmpty()) {
++            continue;
++        }
++        return value.section(QLatin1Char(';'), 0, 0).trimmed();
++    }
++    return QString();
++}
++
++QString DefaultApps::currentDesktopId(const Category &category, const SimpleIniFile &mimeApps,
++                                      const SimpleIniFile &helpers) const
++{
++    if (!category.helperKey.isEmpty()) {
++        const QString helperValue = helpers.value(QString(), category.helperKey).trimmed();
++        const QString helperDesktop = desktopIdForProgram(helperValue);
++        if (!helperDesktop.isEmpty()) {
++            return helperDesktop;
++        }
++    }
++    return currentMimeDefault(mimeApps, category.mimeTypes);
++}
++
++bool DefaultApps::writeWrapper(const QString &wrapperName, const QString &command) const
++{
++    const QString wrapperPath = userLocalBinPath(wrapperName);
++    if (command.trimmed().isEmpty()) {
++        QFile::remove(wrapperPath);
++        return true;
++    }
++
++    const QString script = shellScriptHeader()
++            + QStringLiteral("exec ") + command.trimmed() + QStringLiteral(" \"$@\"\n");
++    return writeTextFile(wrapperPath, script, QFileDevice::ReadOwner | QFileDevice::WriteOwner
++                                                  | QFileDevice::ExeOwner
++                                                  | QFileDevice::ReadGroup
++                                                  | QFileDevice::ExeGroup
++                                                  | QFileDevice::ReadOther
++                                                  | QFileDevice::ExeOther);
++}
++
++bool DefaultApps::writeNotificationBlock(const QString &command) const
++{
++    QString block;
++    const QString cleaned = command.trimmed();
++    if (cleaned.isEmpty()) {
++        block = QStringLiteral("# notification daemon disabled");
++    } else {
++        const QStringList parts = QProcess::splitCommand(cleaned);
++        if (parts.isEmpty()) {
++            block = QStringLiteral("# notification daemon disabled");
++        } else {
++            QStringList quotedParts;
++            for (const QString &part : parts) {
++                quotedParts.push_back(shellSingleQuote(part));
++            }
++            const QString quotedCommand = quotedParts.join(QLatin1Char(' '));
++            const QString processName = QFileInfo(parts.first()).fileName();
++            block = QStringLiteral("if command -v %1 >/dev/null 2>&1; then\n")
++                            .arg(shellSingleQuote(parts.first()))
++                    + QStringLiteral("  if ! pgrep -u \"$(id -u)\" -x %1 >/dev/null 2>&1; then\n")
++                              .arg(shellSingleQuote(processName))
++                    + QStringLiteral("    %1 >/dev/null 2>&1 &\n").arg(quotedCommand)
++                    + QStringLiteral("  fi\nfi");
++        }
++    }
++
++    return replaceManagedBlock(userConfigPath(QStringLiteral("labwc/autostart")),
++                               sectionName(kManagedNotificationBegin),
++                               sectionName(kManagedNotificationEnd), block, shellScriptHeader());
++}
++
++void DefaultApps::activate()
++{
++    m_entries = scanDesktopEntries();
++    m_entriesById.clear();
++    for (const DesktopEntry &entry : m_entries) {
++        m_entriesById[entry.id] = entry;
++    }
++
++    SimpleIniFile mimeApps;
++    mimeApps.load(userConfigPath(QStringLiteral("mimeapps.list")));
++    SimpleIniFile helpers;
++    helpers.load(userConfigPath(QStringLiteral("xfce4/helpers.rc")));
++    SimpleIniFile sessionTools;
++    sessionTools.load(appConfigPath(QStringLiteral("default-apps.ini")));
++
++    for (const Category &category : categories()) {
++        const QString currentId = currentDesktopId(category, mimeApps, helpers);
++        populateDesktopCombo(category.combo, currentId);
++    }
++
++    ui->screenshotTool->setEditable(true);
++    ui->notificationDaemon->setEditable(true);
++
++    QStringList screenshotCommands;
++    if (commandExists(QStringLiteral("grim")) && commandExists(QStringLiteral("slurp"))
++        && commandExists(QStringLiteral("swappy"))) {
++        screenshotCommands.push_back(QStringLiteral("grim -g \"$(slurp)\" - | swappy -f -"));
++    }
++    if (commandExists(QStringLiteral("grim"))) {
++        screenshotCommands.push_back(
++                QStringLiteral("grim \"$HOME/Pictures/screenshot-$(date +%s).png\""));
++    }
++    if (commandExists(QStringLiteral("spectacle"))) {
++        screenshotCommands.push_back(QStringLiteral("spectacle -r"));
++    }
++    if (commandExists(QStringLiteral("flameshot"))) {
++        screenshotCommands.push_back(QStringLiteral("flameshot gui"));
++    }
++    screenshotCommands.removeDuplicates();
++    ui->screenshotTool->clear();
++    ui->screenshotTool->addItems(screenshotCommands);
++
++    QStringList notificationCommands;
++    for (const QString &candidate :
++         { QStringLiteral("mako"), QStringLiteral("swaync"), QStringLiteral("dunst") }) {
++        if (commandExists(candidate)) {
++            notificationCommands.push_back(candidate);
++        }
++    }
++    ui->notificationDaemon->clear();
++    ui->notificationDaemon->addItems(notificationCommands);
++
++    const QString currentScreenshot =
++            sessionTools.value(QStringLiteral("tools"), QStringLiteral("screenshot_command"),
++                               screenshotCommands.isEmpty() ? QString() : screenshotCommands.first());
++    if (ui->screenshotTool->findText(currentScreenshot) < 0 && !currentScreenshot.isEmpty()) {
++        ui->screenshotTool->addItem(currentScreenshot);
++    }
++    ui->screenshotTool->setCurrentText(currentScreenshot);
++
++    const QString currentNotification =
++            sessionTools.value(QStringLiteral("tools"), QStringLiteral("notification_command"),
++                               notificationCommands.isEmpty() ? QString()
++                                                              : notificationCommands.first());
++    if (ui->notificationDaemon->findText(currentNotification) < 0
++        && !currentNotification.isEmpty()) {
++        ui->notificationDaemon->addItem(currentNotification);
++    }
++    ui->notificationDaemon->setCurrentText(currentNotification);
++}
++
++bool DefaultApps::saveMimeDefaults(const SimpleIniFile &mimeApps) const
++{
++    return mimeApps.save(userConfigPath(QStringLiteral("mimeapps.list")));
++}
++
++void DefaultApps::onApply()
++{
++    SimpleIniFile mimeApps;
++    mimeApps.load(userConfigPath(QStringLiteral("mimeapps.list")));
++    SimpleIniFile helpers;
++    helpers.load(userConfigPath(QStringLiteral("xfce4/helpers.rc")));
++    SimpleIniFile sessionTools;
++
++    for (const Category &category : categories()) {
++        const QString desktopId = category.combo->currentData().toString();
++        for (const QString &mimeType : category.mimeTypes) {
++            if (desktopId.isEmpty()) {
++                mimeApps.remove(sectionName(kMimeSection), mimeType);
++            } else {
++                mimeApps.setValue(sectionName(kMimeSection), mimeType, desktopId);
++            }
++        }
++
++        const DesktopEntry entry = entryForId(desktopId);
++        const QString cleanedExec = cleanedDesktopExec(entry.execLine);
++        writeWrapper(category.wrapperName, cleanedExec);
++
++        if (!category.helperKey.isEmpty()) {
++            const QString helperValue = desktopExecProgram(cleanedExec);
++            if (helperValue.isEmpty()) {
++                helpers.remove(QString(), category.helperKey);
++            } else {
++                helpers.setValue(QString(), category.helperKey, helperValue);
++            }
++        }
++    }
++
++    saveMimeDefaults(mimeApps);
++    helpers.save(userConfigPath(QStringLiteral("xfce4/helpers.rc")));
++
++    const QString terminalId = ui->terminal->currentData().toString();
++    writeWrapper(QStringLiteral("xdg-terminal-exec"),
++                 cleanedDesktopExec(entryForId(terminalId).execLine));
++
++    const QString screenshotCommand = ui->screenshotTool->currentText().trimmed();
++    const QString notificationCommand = ui->notificationDaemon->currentText().trimmed();
++    sessionTools.setValue(QStringLiteral("tools"), QStringLiteral("screenshot_command"),
++                          screenshotCommand);
++    sessionTools.setValue(QStringLiteral("tools"), QStringLiteral("notification_command"),
++                          notificationCommand);
++    sessionTools.save(appConfigPath(QStringLiteral("default-apps.ini")));
++
++    writeWrapper(QStringLiteral("labwc-default-screenshot"), screenshotCommand);
++    writeNotificationBlock(notificationCommand);
++}
+diff --git a/src/defaultapps.h b/src/defaultapps.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2597bdb49d13abd26882befb499e75b86004619
+--- /dev/null
++++ b/src/defaultapps.h
+@@ -0,0 +1,56 @@
++#ifndef DEFAULTAPPS_H
++#define DEFAULTAPPS_H
++
++#include <QMap>
++#include <QWidget>
++
++#include "desktop-entry.h"
++
++QT_BEGIN_NAMESPACE
++namespace Ui {
++class pageDefaultApps;
++}
++QT_END_NAMESPACE
++
++class QComboBox;
++
++class DefaultApps : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit DefaultApps(QWidget *parent = nullptr);
++    ~DefaultApps();
++
++    void activate();
++    void onApply();
++
++private:
++    struct Category
++    {
++        QString key;
++        QString wrapperName;
++        QString helperKey;
++        QStringList mimeTypes;
++        QComboBox *combo = nullptr;
++    };
++
++    QList<Category> categories() const;
++    void populateDesktopCombo(QComboBox *combo, const QString &currentId);
++    QString desktopIdForProgram(const QString &program) const;
++    DesktopEntry entryForId(const QString &id) const;
++    void ensureCurrentIdPresent(QComboBox *combo, const QString &desktopId);
++    QString currentDesktopId(const Category &category, const class SimpleIniFile &mimeApps,
++                             const class SimpleIniFile &helpers) const;
++    QString currentMimeDefault(const class SimpleIniFile &mimeApps,
++                               const QStringList &mimeTypes) const;
++    bool writeWrapper(const QString &wrapperName, const QString &command) const;
++    bool writeNotificationBlock(const QString &command) const;
++    bool saveMimeDefaults(const class SimpleIniFile &mimeApps) const;
++
++    Ui::pageDefaultApps *ui;
++    QList<DesktopEntry> m_entries;
++    QMap<QString, DesktopEntry> m_entriesById;
++};
++
++#endif // DEFAULTAPPS_H
+diff --git a/src/defaultapps.ui b/src/defaultapps.ui
+new file mode 100644
+index 0000000000000000000000000000000000000000..536c884c72df218fe9885624ff9b14fa67516eaf
+--- /dev/null
++++ b/src/defaultapps.ui
+@@ -0,0 +1,218 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>pageDefaultApps</class>
++ <widget class="QWidget" name="pageDefaultApps">
++  <layout class="QVBoxLayout" name="verticalLayout">
++   <item>
++    <widget class="QScrollArea" name="scrollArea">
++     <property name="frameShape">
++      <enum>QFrame::Shape::NoFrame</enum>
++     </property>
++     <property name="widgetResizable">
++      <bool>true</bool>
++     </property>
++     <widget class="QWidget" name="scrollAreaWidgetContents">
++      <layout class="QVBoxLayout" name="verticalLayout_2">
++       <property name="spacing">
++        <number>9</number>
++       </property>
++       <item>
++        <widget class="QGroupBox" name="groupBox">
++         <property name="title">
++          <string>Default Applications</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayout" columnstretch="0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label">
++            <property name="text">
++             <string>Web browser</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="webBrowser"/>
++          </item>
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_2">
++            <property name="text">
++             <string>Image viewer</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1">
++           <widget class="QComboBox" name="imageViewer"/>
++          </item>
++          <item row="2" column="0">
++           <widget class="QLabel" name="label_3">
++            <property name="text">
++             <string>File manager</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="1">
++           <widget class="QComboBox" name="fileManager"/>
++          </item>
++          <item row="3" column="0">
++           <widget class="QLabel" name="label_4">
++            <property name="text">
++             <string>Terminal</string>
++            </property>
++           </widget>
++          </item>
++          <item row="3" column="1">
++           <widget class="QComboBox" name="terminal"/>
++          </item>
++          <item row="4" column="0">
++           <widget class="QLabel" name="label_5">
++            <property name="text">
++             <string>Video player</string>
++            </property>
++           </widget>
++          </item>
++          <item row="4" column="1">
++           <widget class="QComboBox" name="videoPlayer"/>
++          </item>
++          <item row="5" column="0">
++           <widget class="QLabel" name="label_6">
++            <property name="text">
++             <string>Music player</string>
++            </property>
++           </widget>
++          </item>
++          <item row="5" column="1">
++           <widget class="QComboBox" name="musicPlayer"/>
++          </item>
++          <item row="6" column="0">
++           <widget class="QLabel" name="label_7">
++            <property name="text">
++             <string>Archive manager</string>
++            </property>
++           </widget>
++          </item>
++          <item row="6" column="1">
++           <widget class="QComboBox" name="archiveManager"/>
++          </item>
++          <item row="7" column="0">
++           <widget class="QLabel" name="label_8">
++            <property name="text">
++             <string>Email client</string>
++            </property>
++           </widget>
++          </item>
++          <item row="7" column="1">
++           <widget class="QComboBox" name="emailClient"/>
++          </item>
++          <item row="8" column="0">
++           <widget class="QLabel" name="label_9">
++            <property name="text">
++             <string>Calendar</string>
++            </property>
++           </widget>
++          </item>
++          <item row="8" column="1">
++           <widget class="QComboBox" name="calendar"/>
++          </item>
++          <item row="9" column="0">
++           <widget class="QLabel" name="label_10">
++            <property name="text">
++             <string>PDF viewer</string>
++            </property>
++           </widget>
++          </item>
++          <item row="9" column="1">
++           <widget class="QComboBox" name="pdfViewer"/>
++          </item>
++          <item row="10" column="0">
++           <widget class="QLabel" name="label_11">
++            <property name="text">
++             <string>Text editor</string>
++            </property>
++           </widget>
++          </item>
++          <item row="10" column="1">
++           <widget class="QComboBox" name="textEditor"/>
++          </item>
++          <item row="0" column="2" rowspan="11">
++           <spacer name="horizontalSpacer">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <widget class="QGroupBox" name="groupBox_2">
++         <property name="title">
++          <string>Session Tools</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayout_2" columnstretch="0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label_12">
++            <property name="text">
++             <string>Screenshot tool</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="screenshotTool"/>
++          </item>
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_13">
++            <property name="text">
++             <string>Notification daemon</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1">
++           <widget class="QComboBox" name="notificationDaemon"/>
++          </item>
++          <item row="2" column="0" colspan="2">
++           <widget class="QLabel" name="label_14">
++            <property name="wordWrap">
++             <bool>true</bool>
++            </property>
++            <property name="text">
++             <string>Labwc-tweaks writes launch wrappers under ~/.local/bin for the selected defaults, and updates XDG MIME defaults where the desktop stack supports them.</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="2" rowspan="3">
++           <spacer name="horizontalSpacer_2">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <spacer name="verticalSpacer">
++         <property name="orientation">
++          <enum>Qt::Orientation::Vertical</enum>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections/>
++</ui>
+diff --git a/src/desktop-entry.cpp b/src/desktop-entry.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1ebf1c462fc6489b6ddb908e7fc98a60d9c6268
+--- /dev/null
++++ b/src/desktop-entry.cpp
+@@ -0,0 +1,100 @@
++#include "desktop-entry.h"
++
++#include <QDir>
++#include <QDirIterator>
++#include <QMap>
++#include <QProcess>
++#include <QRegularExpression>
++#include <QStandardPaths>
++
++#include "simple-ini.h"
++
++static QStringList applicationDirs()
++{
++    QStringList dirs;
++    dirs.push_back(QDir::homePath() + QStringLiteral("/.local/share/applications"));
++
++    const QStringList dataRoots =
++            QStandardPaths::standardLocations(QStandardPaths::GenericDataLocation);
++    for (const QString &root : dataRoots) {
++        dirs.push_back(root + QStringLiteral("/applications"));
++    }
++
++    dirs.removeDuplicates();
++    return dirs;
++}
++
++QList<DesktopEntry> scanDesktopEntries(void)
++{
++    QMap<QString, QString> filesById;
++    for (const QString &dirPath : applicationDirs()) {
++        QDir dir(dirPath);
++        if (!dir.exists()) {
++            continue;
++        }
++
++        QDirIterator iterator(dirPath, QStringList() << QStringLiteral("*.desktop"),
++                              QDir::Files, QDirIterator::NoIteratorFlags);
++        while (iterator.hasNext()) {
++            const QString filePath = iterator.next();
++            const QString id = QFileInfo(filePath).fileName();
++            if (!filesById.contains(id)) {
++                filesById[id] = filePath;
++            }
++        }
++    }
++
++    QList<DesktopEntry> entries;
++    for (auto it = filesById.cbegin(); it != filesById.cend(); ++it) {
++        SimpleIniFile file;
++        if (!file.load(it.value())) {
++            continue;
++        }
++
++        const QString name = file.value(QStringLiteral("Desktop Entry"), QStringLiteral("Name"));
++        const QString exec = file.value(QStringLiteral("Desktop Entry"), QStringLiteral("Exec"));
++        const QString hidden =
++                file.value(QStringLiteral("Desktop Entry"), QStringLiteral("Hidden")).toLower();
++        const QString noDisplay =
++                file.value(QStringLiteral("Desktop Entry"), QStringLiteral("NoDisplay")).toLower();
++
++        if (name.isEmpty() || exec.isEmpty() || hidden == QStringLiteral("true")
++            || noDisplay == QStringLiteral("true")) {
++            continue;
++        }
++
++        DesktopEntry entry;
++        entry.id = it.key();
++        entry.name = name;
++        entry.execLine = exec;
++        entry.terminal =
++                file.value(QStringLiteral("Desktop Entry"), QStringLiteral("Terminal")).toLower()
++                == QStringLiteral("true");
++        entries.push_back(entry);
++    }
++
++    std::sort(entries.begin(), entries.end(), [](const DesktopEntry &lhs, const DesktopEntry &rhs) {
++        return lhs.name.toLower() < rhs.name.toLower();
++    });
++
++    return entries;
++}
++
++QString cleanedDesktopExec(const QString &execLine)
++{
++    QString cleaned = execLine;
++    cleaned.replace(QRegularExpression(QStringLiteral("%[fFuUdDnNickvm]")), QString());
++    cleaned.replace(QStringLiteral("%%"), QStringLiteral("%"));
++    cleaned = cleaned.simplified();
++    return cleaned;
++}
++
++QString desktopExecProgram(const QString &execLine)
++{
++    const QString cleaned = cleanedDesktopExec(execLine);
++    const QStringList parts = QProcess::splitCommand(cleaned);
++    if (parts.isEmpty()) {
++        return QString();
++    }
++    return parts.first();
++}
+diff --git a/src/desktop-entry.h b/src/desktop-entry.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..68e03d6697fd4adc8369c13366e72aa29bff2879
+--- /dev/null
++++ b/src/desktop-entry.h
+@@ -0,0 +1,19 @@
++#ifndef DESKTOP_ENTRY_H
++#define DESKTOP_ENTRY_H
++
++#include <QList>
++#include <QString>
++
++struct DesktopEntry
++{
++    QString id;
++    QString name;
++    QString execLine;
++    bool terminal = false;
++};
++
++QList<DesktopEntry> scanDesktopEntries(void);
++QString cleanedDesktopExec(const QString &execLine);
++QString desktopExecProgram(const QString &execLine);
++
++#endif // DESKTOP_ENTRY_H
+diff --git a/src/display.cpp b/src/display.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6663b6b2861f2a534b1e3937eceaa60269b50b3d
+--- /dev/null
++++ b/src/display.cpp
+@@ -0,0 +1,399 @@
++#include "display.h"
++
++#include <QCheckBox>
++#include <QComboBox>
++#include <QDoubleSpinBox>
++#include <QGridLayout>
++#include <QGroupBox>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QLabel>
++#include <QLayoutItem>
++#include <QProcess>
++
++#include "./ui_display.h"
++#include "config-utils.h"
++#include "simple-ini.h"
++
++namespace {
++QString formatRefresh(double refresh)
++{
++    int rounded = qRound(refresh);
++    if (qAbs(refresh - rounded) < 0.05) {
++        return QString::number(rounded);
++    }
++    return QString::number(refresh, 'f', 2);
++}
++
++QString modeId(int width, int height, double refresh)
++{
++    return QStringLiteral("%1x%2@%3Hz").arg(width).arg(height).arg(formatRefresh(refresh));
++}
++
++QString outputSection(const QString &name)
++{
++    return QStringLiteral("output:%1").arg(name);
++}
++
++QString defaultDisplayConfig()
++{
++    return QStringLiteral("# no outputs selected\n");
++}
++
++QString kanshiQuote(const QString &value)
++{
++    QString escaped = value;
++    escaped.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
++    escaped.replace(QLatin1Char('"'), QStringLiteral("\\\""));
++    return QStringLiteral("\"%1\"").arg(escaped);
++}
++}
++
++DisplayPage::DisplayPage(QWidget *parent) : QWidget(parent), ui(new Ui::pageDisplay)
++{
++    ui->setupUi(this);
++    ui->layoutMode->addItem(tr("Single display"), QStringLiteral("single"));
++    ui->layoutMode->addItem(tr("Mirror"), QStringLiteral("mirror"));
++    ui->layoutMode->addItem(tr("Extend"), QStringLiteral("extend"));
++}
++
++DisplayPage::~DisplayPage()
++{
++    delete ui;
++}
++
++bool DisplayPage::loadOutputs()
++{
++    m_outputs.clear();
++
++    if (!commandExists(QStringLiteral("wlr-randr"))) {
++        ui->statusLabel->setText(tr("wlr-randr is not installed. Display settings can still be saved, but connected outputs cannot be detected right now."));
++        return false;
++    }
++
++    QProcess process;
++    process.start(QStringLiteral("wlr-randr"), QStringList() << QStringLiteral("--json"));
++    process.waitForFinished(5000);
++    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
++        ui->statusLabel->setText(tr("wlr-randr did not return output information for this session."));
++        return false;
++    }
++
++    QJsonParseError error;
++    const QJsonDocument document =
++            QJsonDocument::fromJson(process.readAllStandardOutput(), &error);
++    if (error.error != QJsonParseError::NoError || !document.isArray()) {
++        ui->statusLabel->setText(tr("Failed to parse wlr-randr JSON output."));
++        return false;
++    }
++
++    for (const QJsonValue &value : document.array()) {
++        if (!value.isObject()) {
++            continue;
++        }
++
++        const QJsonObject object = value.toObject();
++        OutputInfo info;
++        info.name = object.value(QStringLiteral("name")).toString();
++        info.description = object.value(QStringLiteral("description")).toString(info.name);
++        info.enabled = object.value(QStringLiteral("enabled")).toBool();
++        info.scale = object.value(QStringLiteral("scale")).toDouble(1.0);
++
++        const QJsonObject position = object.value(QStringLiteral("position")).toObject();
++        info.positionX = position.value(QStringLiteral("x")).toInt();
++        info.positionY = position.value(QStringLiteral("y")).toInt();
++
++        const QJsonArray modes = object.value(QStringLiteral("modes")).toArray();
++        for (const QJsonValue &modeValue : modes) {
++            if (!modeValue.isObject()) {
++                continue;
++            }
++            const QJsonObject modeObject = modeValue.toObject();
++            OutputMode mode;
++            mode.width = modeObject.value(QStringLiteral("width")).toInt();
++            mode.height = modeObject.value(QStringLiteral("height")).toInt();
++            mode.refresh = modeObject.value(QStringLiteral("refresh")).toDouble();
++            mode.preferred = modeObject.value(QStringLiteral("preferred")).toBool();
++            mode.current = modeObject.value(QStringLiteral("current")).toBool();
++            mode.id = modeId(mode.width, mode.height, mode.refresh);
++            mode.label =
++                    QStringLiteral("%1 x %2 @ %3 Hz").arg(mode.width).arg(mode.height).arg(
++                            formatRefresh(mode.refresh));
++            if (mode.preferred) {
++                mode.label += tr(" (preferred)");
++            } else if (mode.current) {
++                mode.label += tr(" (current)");
++            }
++            info.modes.push_back(mode);
++        }
++
++        if (!info.name.isEmpty()) {
++            m_outputs.push_back(info);
++        }
++    }
++
++    ui->statusLabel->setText(m_outputs.isEmpty()
++                                     ? tr("No wlroots outputs were reported by wlr-randr.")
++                                     : tr("Detected %1 output(s) via wlr-randr.").arg(m_outputs.size()));
++    return !m_outputs.isEmpty();
++}
++
++void DisplayPage::clearOutputWidgets()
++{
++    while (QLayoutItem *item = ui->outputsLayout->takeAt(0)) {
++        if (item->widget()) {
++            delete item->widget();
++        }
++        delete item;
++    }
++    m_outputWidgets.clear();
++}
++
++void DisplayPage::rebuildOutputWidgets()
++{
++    clearOutputWidgets();
++
++    SimpleIniFile state;
++    state.load(appConfigPath(QStringLiteral("display.ini")));
++
++    ui->primaryOutput->clear();
++    for (const OutputInfo &output : m_outputs) {
++        ui->primaryOutput->addItem(output.description, output.name);
++    }
++
++    QString preferredPrimary = state.value(QStringLiteral("display"), QStringLiteral("primary"));
++    if (preferredPrimary.isEmpty()) {
++        preferredPrimary = selectedPrimary();
++    }
++
++    const int primaryIndex = ui->primaryOutput->findData(preferredPrimary);
++    ui->primaryOutput->setCurrentIndex(primaryIndex >= 0 ? primaryIndex : 0);
++
++    QString layoutMode = state.value(QStringLiteral("display"), QStringLiteral("layout"));
++    if (layoutMode.isEmpty()) {
++        layoutMode = inferredLayoutMode();
++    }
++    int layoutIndex = ui->layoutMode->findData(layoutMode);
++    if (layoutIndex < 0) {
++        layoutIndex = 0;
++    }
++    ui->layoutMode->setCurrentIndex(layoutIndex);
++
++    for (const OutputInfo &output : m_outputs) {
++        QGroupBox *group = new QGroupBox(output.description, this);
++        QGridLayout *layout = new QGridLayout(group);
++        layout->setHorizontalSpacing(16);
++        layout->setVerticalSpacing(8);
++
++        OutputWidgets widgets;
++        widgets.enabled = new QCheckBox(tr("Enable"), group);
++        const QString section = outputSection(output.name);
++        const QString storedEnabled = state.value(section, QStringLiteral("enabled"));
++        widgets.enabled->setChecked(storedEnabled.isEmpty() ? output.enabled
++                                                            : storedEnabled == QStringLiteral("true"));
++        layout->addWidget(widgets.enabled, 0, 0, 1, 2);
++
++        QLabel *modeLabel = new QLabel(tr("Mode"), group);
++        layout->addWidget(modeLabel, 1, 0);
++        widgets.mode = new QComboBox(group);
++        QString currentMode = state.value(section, QStringLiteral("mode"));
++        for (const OutputMode &mode : output.modes) {
++            widgets.mode->addItem(mode.label, mode.id);
++            if (currentMode.isEmpty() && mode.current) {
++                currentMode = mode.id;
++            }
++        }
++        int modeIndex = widgets.mode->findData(currentMode);
++        widgets.mode->setCurrentIndex(modeIndex >= 0 ? modeIndex : 0);
++        layout->addWidget(widgets.mode, 1, 1);
++
++        QLabel *scaleLabel = new QLabel(tr("Scale"), group);
++        layout->addWidget(scaleLabel, 2, 0);
++        widgets.scale = new QDoubleSpinBox(group);
++        widgets.scale->setDecimals(2);
++        widgets.scale->setMinimum(0.50);
++        widgets.scale->setMaximum(4.00);
++        widgets.scale->setSingleStep(0.25);
++        const QString storedScale = state.value(section, QStringLiteral("scale"));
++        widgets.scale->setValue(storedScale.isEmpty() ? output.scale : storedScale.toDouble());
++        layout->addWidget(widgets.scale, 2, 1);
++
++        widgets.description = new QLabel(output.name, group);
++        widgets.description->setTextInteractionFlags(Qt::TextSelectableByMouse);
++        layout->addWidget(widgets.description, 3, 0, 1, 2);
++
++        ui->outputsLayout->addWidget(group);
++        m_outputWidgets[output.name] = widgets;
++    }
++}
++
++QString DisplayPage::inferredLayoutMode() const
++{
++    int enabledCount = 0;
++    bool samePosition = true;
++    int firstX = 0;
++    int firstY = 0;
++    bool firstSet = false;
++
++    for (const OutputInfo &output : m_outputs) {
++        if (!output.enabled) {
++            continue;
++        }
++        ++enabledCount;
++        if (!firstSet) {
++            firstX = output.positionX;
++            firstY = output.positionY;
++            firstSet = true;
++            continue;
++        }
++        samePosition = samePosition && output.positionX == firstX && output.positionY == firstY;
++    }
++
++    if (enabledCount <= 1) {
++        return QStringLiteral("single");
++    }
++    return samePosition ? QStringLiteral("mirror") : QStringLiteral("extend");
++}
++
++QString DisplayPage::selectedPrimary() const
++{
++    for (const OutputInfo &output : m_outputs) {
++        if (output.enabled) {
++            return output.name;
++        }
++    }
++    return m_outputs.isEmpty() ? QString() : m_outputs.first().name;
++}
++
++DisplayPage::OutputMode DisplayPage::selectedMode(const QString &outputName) const
++{
++    OutputMode fallback;
++    for (const OutputInfo &output : m_outputs) {
++        if (output.name != outputName) {
++            continue;
++        }
++        const QString selectedId = m_outputWidgets.value(outputName).mode->currentData().toString();
++        for (const OutputMode &mode : output.modes) {
++            if (mode.id == selectedId) {
++                return mode;
++            }
++            if (fallback.id.isEmpty() && mode.current) {
++                fallback = mode;
++            }
++        }
++        if (fallback.id.isEmpty() && !output.modes.isEmpty()) {
++            fallback = output.modes.first();
++        }
++        break;
++    }
++    return fallback;
++}
++
++QString DisplayPage::kanshiConfig() const
++{
++    QStringList enabledOutputs;
++    for (auto it = m_outputWidgets.cbegin(); it != m_outputWidgets.cend(); ++it) {
++        if (it.value().enabled->isChecked()) {
++            enabledOutputs.push_back(it.key());
++        }
++    }
++    if (enabledOutputs.isEmpty()) {
++        return defaultDisplayConfig();
++    }
++
++    const QString primary = ui->primaryOutput->currentData().toString();
++    enabledOutputs.removeAll(primary);
++    enabledOutputs.push_front(primary);
++    enabledOutputs.removeDuplicates();
++
++    const QString layoutMode = ui->layoutMode->currentData().toString();
++    QStringList config;
++
++    for (const QString &soloOutput : enabledOutputs) {
++        config << QStringLiteral("profile solo-%1 {").arg(soloOutput);
++        for (const OutputInfo &output : m_outputs) {
++            if (output.name == soloOutput) {
++                const OutputMode mode = selectedMode(output.name);
++                const double scale = m_outputWidgets.value(output.name).scale->value();
++                config << QStringLiteral("  output %1 mode %2 scale %3 position 0,0 enable")
++                                  .arg(kanshiQuote(output.name), mode.id,
++                                       QString::number(scale, 'f', 2));
++            } else {
++                config << QStringLiteral("  output %1 disable").arg(kanshiQuote(output.name));
++            }
++        }
++        config << QStringLiteral("}");
++        config << QString();
++    }
++
++    if (enabledOutputs.size() > 1 && layoutMode != QStringLiteral("single")) {
++        config << QStringLiteral("profile labwc-tweaks {");
++        int currentX = 0;
++        for (const QString &outputName : enabledOutputs) {
++            const OutputMode mode = selectedMode(outputName);
++            const double scale = m_outputWidgets.value(outputName).scale->value();
++            config << QStringLiteral("  output %1 mode %2 scale %3 position %4,0 enable")
++                              .arg(kanshiQuote(outputName), mode.id,
++                                   QString::number(scale, 'f', 2), QString::number(currentX));
++            if (layoutMode == QStringLiteral("extend")) {
++                currentX += qRound(mode.width / scale);
++            }
++        }
++        for (const OutputInfo &output : m_outputs) {
++            if (!enabledOutputs.contains(output.name)) {
++                config << QStringLiteral("  output %1 disable").arg(kanshiQuote(output.name));
++            }
++        }
++        config << QStringLiteral("}");
++        config << QString();
++    }
++
++    return config.join(QLatin1Char('\n'));
++}
++
++void DisplayPage::signalKanshiReload() const
++{
++    if (!commandExists(QStringLiteral("kanshi"))) {
++        return;
++    }
++
++    QProcess process;
++    process.start(QStringLiteral("pkill"),
++                  QStringList() << QStringLiteral("-HUP") << QStringLiteral("-x")
++                                << QStringLiteral("kanshi"));
++    process.waitForFinished(1000);
++
++    if (process.exitCode() != 0) {
++        QProcess::startDetached(QStringLiteral("kanshi"));
++    }
++}
++
++void DisplayPage::activate()
++{
++    loadOutputs();
++    rebuildOutputWidgets();
++}
++
++void DisplayPage::onApply()
++{
++    SimpleIniFile state;
++    state.setValue(QStringLiteral("display"), QStringLiteral("layout"),
++                   ui->layoutMode->currentData().toString());
++    state.setValue(QStringLiteral("display"), QStringLiteral("primary"),
++                   ui->primaryOutput->currentData().toString());
++
++    for (auto it = m_outputWidgets.cbegin(); it != m_outputWidgets.cend(); ++it) {
++        state.setValue(outputSection(it.key()), QStringLiteral("enabled"),
++                       it.value().enabled->isChecked() ? QStringLiteral("true")
++                                                       : QStringLiteral("false"));
++        state.setValue(outputSection(it.key()), QStringLiteral("mode"),
++                       it.value().mode->currentData().toString());
++        state.setValue(outputSection(it.key()), QStringLiteral("scale"),
++                       QString::number(it.value().scale->value(), 'f', 2));
++    }
++    state.save(appConfigPath(QStringLiteral("display.ini")));
++
++    writeTextFile(userConfigPath(QStringLiteral("kanshi/config")), kanshiConfig());
++    signalKanshiReload();
++}
+diff --git a/src/display.h b/src/display.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..01c7dba8135c5ee40dbe58d2679715215fb3ee2f
+--- /dev/null
++++ b/src/display.h
+@@ -0,0 +1,75 @@
++#ifndef DISPLAY_H
++#define DISPLAY_H
++
++#include <QMap>
++#include <QVector>
++#include <QWidget>
++
++QT_BEGIN_NAMESPACE
++namespace Ui {
++class pageDisplay;
++}
++QT_END_NAMESPACE
++
++class QCheckBox;
++class QComboBox;
++class QDoubleSpinBox;
++class QLabel;
++
++class DisplayPage : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit DisplayPage(QWidget *parent = nullptr);
++    ~DisplayPage();
++
++    void activate();
++    void onApply();
++
++private:
++    struct OutputMode
++    {
++        QString id;
++        QString label;
++        int width = 0;
++        int height = 0;
++        double refresh = 0.0;
++        bool preferred = false;
++        bool current = false;
++    };
++
++    struct OutputInfo
++    {
++        QString name;
++        QString description;
++        bool enabled = false;
++        int positionX = 0;
++        int positionY = 0;
++        double scale = 1.0;
++        QVector<OutputMode> modes;
++    };
++
++    struct OutputWidgets
++    {
++        QCheckBox *enabled = nullptr;
++        QLabel *description = nullptr;
++        QComboBox *mode = nullptr;
++        QDoubleSpinBox *scale = nullptr;
++    };
++
++    bool loadOutputs();
++    void rebuildOutputWidgets();
++    void clearOutputWidgets();
++    QString inferredLayoutMode() const;
++    QString selectedPrimary() const;
++    OutputMode selectedMode(const QString &outputName) const;
++    QString kanshiConfig() const;
++    void signalKanshiReload() const;
++
++    Ui::pageDisplay *ui;
++    QVector<OutputInfo> m_outputs;
++    QMap<QString, OutputWidgets> m_outputWidgets;
++};
++
++#endif // DISPLAY_H
+diff --git a/src/display.ui b/src/display.ui
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca5381caf2968650d0c1edf0923fedde93562ba5
+--- /dev/null
++++ b/src/display.ui
+@@ -0,0 +1,94 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>pageDisplay</class>
++ <widget class="QWidget" name="pageDisplay">
++  <layout class="QVBoxLayout" name="verticalLayout">
++   <item>
++    <widget class="QScrollArea" name="scrollArea">
++     <property name="frameShape">
++      <enum>QFrame::Shape::NoFrame</enum>
++     </property>
++     <property name="widgetResizable">
++      <bool>true</bool>
++     </property>
++     <widget class="QWidget" name="scrollAreaWidgetContents">
++      <layout class="QVBoxLayout" name="verticalLayout_2">
++       <property name="spacing">
++        <number>9</number>
++       </property>
++       <item>
++        <widget class="QGroupBox" name="groupBox">
++         <property name="title">
++          <string>Layout</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayout" columnstretch="0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label">
++            <property name="text">
++             <string>Layout mode</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="layoutMode"/>
++          </item>
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_2">
++            <property name="text">
++             <string>Primary output</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1">
++           <widget class="QComboBox" name="primaryOutput"/>
++          </item>
++          <item row="2" column="0" colspan="2">
++           <widget class="QLabel" name="statusLabel">
++            <property name="wordWrap">
++             <bool>true</bool>
++            </property>
++            <property name="text">
++             <string>Display detection status will appear here.</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="2" rowspan="3">
++           <spacer name="horizontalSpacer">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <widget class="QGroupBox" name="groupBox_2">
++         <property name="title">
++          <string>Outputs</string>
++         </property>
++         <layout class="QVBoxLayout" name="outputsLayout"/>
++        </widget>
++       </item>
++       <item>
++        <spacer name="verticalSpacer">
++         <property name="orientation">
++          <enum>Qt::Orientation::Vertical</enum>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections/>
++</ui>
+diff --git a/src/find-themes.cpp b/src/find-themes.cpp
+index 59432ec6c5684d7e4affcb5d4a905cb9eb5bfd82..34a880164ed39b303f414270e2f894273f997395 100644
+--- a/src/find-themes.cpp
++++ b/src/find-themes.cpp
+@@ -68,6 +68,12 @@ static bool hasOpenboxOrLabwcSubdir(QString path)
+     return entries.contains("openbox-3") || entries.contains("labwc");
+ }
+ 
++static bool hasGtkSubdir(QString path)
++{
++    QStringList entries = QDir(path).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
++    return entries.contains("gtk-3.0") || entries.contains("gtk-4.0");
++}
++
+ QStringList findLabwcThemes(void)
+ {
+     QStringList paths;
+@@ -94,3 +100,31 @@ QStringList findLabwcThemes(void)
+     themes.sort(Qt::CaseInsensitive);
+     return themes;
+ }
++
++QStringList findGtkThemes(void)
++{
++    QStringList paths;
++
++    paths.push_back(QString(qgetenv("HOME") + "/.themes"));
++    QStringList standardPaths =
++            QStandardPaths::standardLocations(QStandardPaths::GenericDataLocation);
++    for (const QString &path : std::as_const(standardPaths)) {
++        paths.push_back(QString(path + "/themes"));
++    }
++
++    QStringList themes;
++    themes.push_front("Adwaita");
++    for (const QString &path : std::as_const(paths)) {
++        QDir dir(path);
++        QStringList entries = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
++        for (const QString &entry : std::as_const(entries)) {
++            if (hasGtkSubdir(QString(path + "/" + entry))) {
++                themes.push_back(entry);
++            }
++        }
++    }
++
++    themes.removeDuplicates();
++    themes.sort(Qt::CaseInsensitive);
++    return themes;
++}
+diff --git a/src/find-themes.h b/src/find-themes.h
+index 08a355795b23179b3d72673dd52c3821021626b6..684a93445a3d55094104bff702cc03ff88ef6643 100644
+--- a/src/find-themes.h
++++ b/src/find-themes.h
+@@ -9,5 +9,6 @@ enum lab_icon_theme_type {
+ 
+ QStringList findIconThemes(enum lab_icon_theme_type type);
+ QStringList findLabwcThemes(void);
++QStringList findGtkThemes(void);
+ 
+ #endif // FIND_THEMES_H
+diff --git a/src/loginscreen.cpp b/src/loginscreen.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b378dc85595e39f1523a4888574d3e413af0a680
+--- /dev/null
++++ b/src/loginscreen.cpp
+@@ -0,0 +1,116 @@
++#include "loginscreen.h"
++
++#include <QDir>
++#include <QFileDialog>
++#include <QFileInfo>
++#include <QMessageBox>
++#include <QProcess>
++
++#include "./ui_loginscreen.h"
++#include "config-utils.h"
++#include "find-themes.h"
++#include "simple-ini.h"
++
++LoginScreen::LoginScreen(QWidget *parent) : QWidget(parent), ui(new Ui::pageLoginScreen)
++{
++    ui->setupUi(this);
++
++    connect(ui->browseBackground, &QPushButton::clicked, this, [&]() {
++        QString selected =
++                QFileDialog::getOpenFileName(this, tr("Select login background"), QDir::homePath());
++        if (!selected.isEmpty()) {
++            ui->backgroundPath->setText(selected);
++        }
++    });
++}
++
++LoginScreen::~LoginScreen()
++{
++    delete ui;
++}
++
++void LoginScreen::activate()
++{
++    ui->gtkTheme->clear();
++    ui->gtkTheme->addItems(findGtkThemes());
++
++    SimpleIniFile state;
++    state.load(appConfigPath(QStringLiteral("login-screen.ini")));
++    SimpleIniFile regreetToml;
++    regreetToml.load(QStringLiteral("/etc/greetd/regreet.toml"));
++
++    const QString gtkTheme =
++            state.value(QStringLiteral("regreet"), QStringLiteral("gtk_theme"),
++                        regreetToml.value(QStringLiteral("GTK"), QStringLiteral("theme_name"),
++                                          QStringLiteral("\"Adwaita\""))
++                                .remove(QLatin1Char('"')));
++    int themeIndex = ui->gtkTheme->findText(gtkTheme);
++    ui->gtkTheme->setCurrentIndex(themeIndex >= 0 ? themeIndex : 0);
++
++    ui->backgroundPath->setText(
++            state.value(QStringLiteral("regreet"), QStringLiteral("background_path")));
++    ui->panelBackground->setText(
++            state.value(QStringLiteral("regreet"), QStringLiteral("panel_background"),
++                        QStringLiteral("rgba(12, 8, 20, 0.86)")));
++    ui->textColor->setText(
++            state.value(QStringLiteral("regreet"), QStringLiteral("text_color"),
++                        QStringLiteral("#f5f3ff")));
++    ui->accentColor->setText(
++            state.value(QStringLiteral("regreet"), QStringLiteral("accent_color"),
++                        QStringLiteral("#c4b5fd")));
++    ui->fieldBackground->setText(
++            state.value(QStringLiteral("regreet"), QStringLiteral("field_background"),
++                        QStringLiteral("rgba(23, 15, 35, 0.96)")));
++}
++
++void LoginScreen::onApply()
++{
++    const QString backgroundPath = ui->backgroundPath->text().trimmed();
++    if (!backgroundPath.isEmpty() && !QFileInfo::exists(backgroundPath)) {
++        QMessageBox::warning(this, tr("Login Screen"),
++                             tr("The selected background image does not exist."));
++        return;
++    }
++
++    SimpleIniFile state;
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("gtk_theme"), ui->gtkTheme->currentText());
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("background_path"), backgroundPath);
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("panel_background"),
++                   ui->panelBackground->text().trimmed());
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("text_color"),
++                   ui->textColor->text().trimmed());
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("accent_color"),
++                   ui->accentColor->text().trimmed());
++    state.setValue(QStringLiteral("regreet"), QStringLiteral("field_background"),
++                   ui->fieldBackground->text().trimmed());
++    state.save(appConfigPath(QStringLiteral("login-screen.ini")));
++
++    if (!commandExists(QStringLiteral("pkexec"))) {
++        QMessageBox::warning(this, tr("Login Screen"),
++                             tr("pkexec is not available, so system login-screen settings cannot be applied."));
++        return;
++    }
++
++    const QString helperPath =
++            QStringLiteral(PROJECT_LIBEXEC_DIR) + QStringLiteral("/labwc-tweaks-apply-login-screen");
++
++    QProcess process;
++    process.start(QStringLiteral("pkexec"),
++                  QStringList() << helperPath << QStringLiteral("--background") << backgroundPath
++                                << QStringLiteral("--gtk-theme") << ui->gtkTheme->currentText()
++                                << QStringLiteral("--panel-bg")
++                                << ui->panelBackground->text().trimmed()
++                                << QStringLiteral("--text-color")
++                                << ui->textColor->text().trimmed()
++                                << QStringLiteral("--accent-color")
++                                << ui->accentColor->text().trimmed()
++                                << QStringLiteral("--field-bg")
++                                << ui->fieldBackground->text().trimmed());
++    process.waitForFinished(-1);
++
++    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
++        QMessageBox::warning(this, tr("Login Screen"),
++                             tr("Failed to update greetd/regreet.\n\n%1")
++                                     .arg(QString::fromUtf8(process.readAllStandardError())));
++    }
++}
+diff --git a/src/loginscreen.h b/src/loginscreen.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f183a0e2d0dcbfa344eeee2f00fbc46bfebc4fe5
+--- /dev/null
++++ b/src/loginscreen.h
+@@ -0,0 +1,27 @@
++#ifndef LOGINSCREEN_H
++#define LOGINSCREEN_H
++
++#include <QWidget>
++
++QT_BEGIN_NAMESPACE
++namespace Ui {
++class pageLoginScreen;
++}
++QT_END_NAMESPACE
++
++class LoginScreen : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit LoginScreen(QWidget *parent = nullptr);
++    ~LoginScreen();
++
++    void activate();
++    void onApply();
++
++private:
++    Ui::pageLoginScreen *ui;
++};
++
++#endif // LOGINSCREEN_H
+diff --git a/src/loginscreen.ui b/src/loginscreen.ui
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b5362461df53094d5fc9fb03709805cce0d5efa
+--- /dev/null
++++ b/src/loginscreen.ui
+@@ -0,0 +1,148 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>pageLoginScreen</class>
++ <widget class="QWidget" name="pageLoginScreen">
++  <layout class="QVBoxLayout" name="verticalLayout">
++   <item>
++    <widget class="QScrollArea" name="scrollArea">
++     <property name="frameShape">
++      <enum>QFrame::Shape::NoFrame</enum>
++     </property>
++     <property name="widgetResizable">
++      <bool>true</bool>
++     </property>
++     <widget class="QWidget" name="scrollAreaWidgetContents">
++      <layout class="QVBoxLayout" name="verticalLayout_2">
++       <property name="spacing">
++        <number>9</number>
++       </property>
++       <item>
++        <widget class="QGroupBox" name="groupBox">
++         <property name="title">
++          <string>Background</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayout" columnstretch="0,0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label">
++            <property name="text">
++             <string>Image</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1" colspan="2">
++           <widget class="QLineEdit" name="backgroundPath"/>
++          </item>
++          <item row="0" column="3">
++           <widget class="QPushButton" name="browseBackground">
++            <property name="text">
++             <string>Browse…</string>
++            </property>
++           </widget>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <widget class="QGroupBox" name="groupBox_2">
++         <property name="title">
++          <string>Theme</string>
++         </property>
++         <layout class="QGridLayout" name="gridLayout_2" columnstretch="0,0,1">
++          <property name="horizontalSpacing">
++           <number>16</number>
++          </property>
++          <property name="verticalSpacing">
++           <number>8</number>
++          </property>
++          <item row="0" column="0">
++           <widget class="QLabel" name="label_2">
++            <property name="text">
++             <string>GTK theme</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="1">
++           <widget class="QComboBox" name="gtkTheme"/>
++          </item>
++          <item row="1" column="0">
++           <widget class="QLabel" name="label_3">
++            <property name="text">
++             <string>Panel background</string>
++            </property>
++           </widget>
++          </item>
++          <item row="1" column="1">
++           <widget class="QLineEdit" name="panelBackground"/>
++          </item>
++          <item row="2" column="0">
++           <widget class="QLabel" name="label_4">
++            <property name="text">
++             <string>Text color</string>
++            </property>
++           </widget>
++          </item>
++          <item row="2" column="1">
++           <widget class="QLineEdit" name="textColor"/>
++          </item>
++          <item row="3" column="0">
++           <widget class="QLabel" name="label_5">
++            <property name="text">
++             <string>Accent color</string>
++            </property>
++           </widget>
++          </item>
++          <item row="3" column="1">
++           <widget class="QLineEdit" name="accentColor"/>
++          </item>
++          <item row="4" column="0">
++           <widget class="QLabel" name="label_6">
++            <property name="text">
++             <string>Field background</string>
++            </property>
++           </widget>
++          </item>
++          <item row="4" column="1">
++           <widget class="QLineEdit" name="fieldBackground"/>
++          </item>
++          <item row="5" column="0" colspan="2">
++           <widget class="QLabel" name="label_7">
++            <property name="wordWrap">
++             <bool>true</bool>
++            </property>
++            <property name="text">
++             <string>Applying these settings requires polkit authentication because greetd/regreet live under /etc and /usr.</string>
++            </property>
++           </widget>
++          </item>
++          <item row="0" column="2" rowspan="6">
++           <spacer name="horizontalSpacer">
++            <property name="orientation">
++             <enum>Qt::Orientation::Horizontal</enum>
++            </property>
++           </spacer>
++          </item>
++         </layout>
++        </widget>
++       </item>
++       <item>
++        <spacer name="verticalSpacer">
++         <property name="orientation">
++          <enum>Qt::Orientation::Vertical</enum>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections/>
++</ui>
+diff --git a/src/maindialog.cpp b/src/maindialog.cpp
+index 5a3f440c43b2fe693afbd78ee57a0f87cc494191..ae56b3dcd38b5a533b9a01f72d9f392460ffa3be 100644
+--- a/src/maindialog.cpp
++++ b/src/maindialog.cpp
+@@ -8,10 +8,13 @@
+ #include <QtWidgets/QVBoxLayout>
+ #include <QtWidgets/QWidget>
+ #include "appearance.h"
++#include "defaultapps.h"
++#include "display.h"
+ #include "behaviour.h"
+ #include "mouse.h"
+ #include "keyboard.h"
+ #include "touchscreen.h"
++#include "loginscreen.h"
+ #include "about.h"
+ #include "template.h"
+ 
+@@ -47,24 +50,36 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
+     item0->setText(tr("Appearance"));
+ 
+     QListWidgetItem *item1 = new QListWidgetItem(list);
+-    item1->setIcon(QIcon::fromTheme("preferences-desktop"));
+-    item1->setText(tr("Behaviour"));
++    item1->setIcon(QIcon::fromTheme("preferences-desktop-default-applications"));
++    item1->setText(tr("Default Apps"));
+ 
+     QListWidgetItem *item2 = new QListWidgetItem(list);
+-    item2->setIcon(QIcon::fromTheme("input-mouse"));
+-    item2->setText(tr("Mouse & Touchpad"));
++    item2->setIcon(QIcon::fromTheme("video-display"));
++    item2->setText(tr("Display"));
+ 
+     QListWidgetItem *item3 = new QListWidgetItem(list);
+-    item3->setIcon(QIcon::fromTheme("preferences-desktop-keyboard"));
+-    item3->setText(tr("Keyboard"));
++    item3->setIcon(QIcon::fromTheme("preferences-desktop"));
++    item3->setText(tr("Behaviour"));
+ 
+     QListWidgetItem *item4 = new QListWidgetItem(list);
+-    item4->setIcon(QIcon::fromTheme("preferences-desktop-touchscreen"));
+-    item4->setText(tr("Touchscreen"));
++    item4->setIcon(QIcon::fromTheme("input-mouse"));
++    item4->setText(tr("Mouse & Touchpad"));
+ 
+     QListWidgetItem *item5 = new QListWidgetItem(list);
+-    item5->setIcon(QIcon::fromTheme("help-about"));
+-    item5->setText(tr("About"));
++    item5->setIcon(QIcon::fromTheme("preferences-desktop-keyboard"));
++    item5->setText(tr("Keyboard"));
++
++    QListWidgetItem *item6 = new QListWidgetItem(list);
++    item6->setIcon(QIcon::fromTheme("preferences-desktop-touchscreen"));
++    item6->setText(tr("Touchscreen"));
++
++    QListWidgetItem *item7 = new QListWidgetItem(list);
++    item7->setIcon(QIcon::fromTheme("system-switch-user"));
++    item7->setText(tr("Login Screen"));
++
++    QListWidgetItem *item8 = new QListWidgetItem(list);
++    item8->setIcon(QIcon::fromTheme("help-about"));
++    item8->setText(tr("About"));
+ 
+     if (!qgetenv("LABWC_TWEAKS_SHOW_TEMPLATE").isEmpty()) {
+         QListWidgetItem *item99 = new QListWidgetItem(list);
+@@ -89,6 +104,12 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
+     m_pageAppearance = new Appearance();
+     stack->addWidget(m_pageAppearance);
+ 
++    m_pageDefaultApps = new DefaultApps();
++    stack->addWidget(m_pageDefaultApps);
++
++    m_pageDisplay = new DisplayPage();
++    stack->addWidget(m_pageDisplay);
++
+     m_pageBehaviour = new Behaviour();
+     stack->addWidget(m_pageBehaviour);
+ 
+@@ -101,6 +122,9 @@ MainDialog::MainDialog(QWidget *parent) : QDialog(parent)
+     m_pageTouchscreen = new Touchscreen();
+     stack->addWidget(m_pageTouchscreen);
+ 
++    m_pageLoginScreen = new LoginScreen();
++    stack->addWidget(m_pageLoginScreen);
++
+     m_pageAbout = new About();
+     stack->addWidget(m_pageAbout);
+ 
+@@ -146,10 +170,13 @@ MainDialog::~MainDialog()
+ void MainDialog::activate()
+ {
+     m_pageAppearance->activate();
++    m_pageDefaultApps->activate();
++    m_pageDisplay->activate();
+     m_pageBehaviour->activate();
+     m_pageMouse->activate();
+     m_pageKeyboard->activate();
+     m_pageTouchscreen->activate();
++    m_pageLoginScreen->activate();
+     m_pageAbout->loadInfo();
+     m_pageAbout->getEnv();
+     if (!qgetenv("LABWC_TWEAKS_SHOW_TEMPLATE").isEmpty()) {
+@@ -160,10 +187,13 @@ void MainDialog::activate()
+ void MainDialog::onApply()
+ {
+     m_pageAppearance->onApply();
++    m_pageDefaultApps->onApply();
++    m_pageDisplay->onApply();
+     m_pageBehaviour->onApply();
+     m_pageMouse->onApply();
+     m_pageKeyboard->onApply();
+     m_pageTouchscreen->onApply();
++    m_pageLoginScreen->onApply();
+ 
+     xml_save();
+     environmentSave();
+diff --git a/src/maindialog.h b/src/maindialog.h
+index 66218d568db4d8447c261e845260741c5f0b2e21..c4feb49cb769e445216cd00a4d6a9c44d1929644 100644
+--- a/src/maindialog.h
++++ b/src/maindialog.h
+@@ -5,10 +5,13 @@
+ #include "settings.h"
+ 
+ class Appearance;
++class DefaultApps;
++class DisplayPage;
+ class Behaviour;
+ class Mouse;
+ class Keyboard;
+ class Touchscreen;
++class LoginScreen;
+ class About;
+ class Template;
+ 
+@@ -26,10 +29,13 @@ private:
+ 
+     QDialogButtonBox *m_buttonBox;
+     Appearance *m_pageAppearance;
++    DefaultApps *m_pageDefaultApps;
++    DisplayPage *m_pageDisplay;
+     Behaviour *m_pageBehaviour;
+     Mouse *m_pageMouse;
+     Keyboard *m_pageKeyboard;
+     Touchscreen *m_pageTouchscreen;
++    LoginScreen *m_pageLoginScreen;
+     About *m_pageAbout;
+     Template *m_pageTemplate;
+ };
+diff --git a/src/simple-ini.cpp b/src/simple-ini.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..327c7ad3987392b81b05ba4fb235841ef12e1b04
+--- /dev/null
++++ b/src/simple-ini.cpp
+@@ -0,0 +1,122 @@
++#include "simple-ini.h"
++
++#include <QDir>
++#include <QFileInfo>
++#include <QFile>
++#include <QSaveFile>
++#include <QTextStream>
++
++bool SimpleIniFile::load(const QString &path)
++{
++    m_values.clear();
++
++    QFile file(path);
++    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        return false;
++    }
++
++    QTextStream stream(&file);
++    QString currentSection;
++    while (!stream.atEnd()) {
++        QString line = stream.readLine().trimmed();
++        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))
++            || line.startsWith(QLatin1Char(';'))) {
++            continue;
++        }
++        if (line.startsWith(QLatin1Char('[')) && line.endsWith(QLatin1Char(']'))) {
++            currentSection = line.mid(1, line.size() - 2).trimmed();
++            continue;
++        }
++
++        int delimiter = line.indexOf(QLatin1Char('='));
++        if (delimiter < 0) {
++            continue;
++        }
++
++        QString key = line.left(delimiter).trimmed();
++        QString value = line.mid(delimiter + 1).trimmed();
++        m_values[currentSection][key] = value;
++    }
++
++    return true;
++}
++
++bool SimpleIniFile::save(const QString &path) const
++{
++    const QFileInfo info(path);
++    if (!info.dir().exists() && !QDir().mkpath(info.dir().path())) {
++        return false;
++    }
++
++    QSaveFile file(path);
++    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
++        return false;
++    }
++
++    QTextStream stream(&file);
++
++    auto writeSection = [&stream](const QString &section, const QMap<QString, QString> &values,
++                                  bool leadingBlank) {
++        if (values.isEmpty()) {
++            return;
++        }
++        if (leadingBlank) {
++            stream << '\n';
++        }
++        if (!section.isEmpty()) {
++            stream << '[' << section << "]\n";
++        }
++        for (auto it = values.cbegin(); it != values.cend(); ++it) {
++            stream << it.key() << '=' << it.value() << '\n';
++        }
++    };
++
++    bool wroteRoot = false;
++    if (m_values.contains(QString())) {
++        writeSection(QString(), m_values.value(QString()), false);
++        wroteRoot = !m_values.value(QString()).isEmpty();
++    }
++
++    bool wroteAnyNamed = false;
++    for (auto it = m_values.cbegin(); it != m_values.cend(); ++it) {
++        if (it.key().isEmpty()) {
++            continue;
++        }
++        writeSection(it.key(), it.value(), wroteRoot || wroteAnyNamed);
++        wroteAnyNamed = wroteAnyNamed || !it.value().isEmpty();
++    }
++
++    if (!file.commit()) {
++        return false;
++    }
++    return true;
++}
++
++QString SimpleIniFile::value(const QString &section, const QString &key, const QString &defaultValue) const
++{
++    if (!m_values.contains(section)) {
++        return defaultValue;
++    }
++    return m_values.value(section).value(key, defaultValue);
++}
++
++void SimpleIniFile::setValue(const QString &section, const QString &key, const QString &value)
++{
++    m_values[section][key] = value;
++}
++
++void SimpleIniFile::remove(const QString &section, const QString &key)
++{
++    if (!m_values.contains(section)) {
++        return;
++    }
++    m_values[section].remove(key);
++    if (m_values[section].isEmpty()) {
++        m_values.remove(section);
++    }
++}
++
++bool SimpleIniFile::contains(const QString &section, const QString &key) const
++{
++    return m_values.contains(section) && m_values.value(section).contains(key);
++}
+diff --git a/src/simple-ini.h b/src/simple-ini.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5427d26edc46d0865beac416413ea29a276ea665
+--- /dev/null
++++ b/src/simple-ini.h
+@@ -0,0 +1,23 @@
++#ifndef SIMPLE_INI_H
++#define SIMPLE_INI_H
++
++#include <QMap>
++#include <QString>
++
++class SimpleIniFile
++{
++public:
++    bool load(const QString &path);
++    bool save(const QString &path) const;
++
++    QString value(const QString &section, const QString &key,
++                  const QString &defaultValue = QString()) const;
++    void setValue(const QString &section, const QString &key, const QString &value);
++    void remove(const QString &section, const QString &key);
++    bool contains(const QString &section, const QString &key) const;
++
++private:
++    QMap<QString, QMap<QString, QString>> m_values;
++};
++
++#endif // SIMPLE_INI_H
